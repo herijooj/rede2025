@@ -87,14 +87,11 @@ void print_transfer_summary(const struct TransferStats *stats);
 // Transfer-related functions
 void transfer_init_stats(struct TransferStats *stats, size_t expected_size);
 void transfer_update_stats(struct TransferStats *stats, size_t bytes, uint8_t seq);
-void transfer_handle_wrap(struct TransferStats *stats);
-void transfer_record_error(struct TransferStats *stats, int error_type);
 bool transfer_is_duplicate(const struct TransferStats *stats, uint8_t seq);
 
 // Add new debug functions
 void debug_packet_validation(const struct Packet *packet, uint8_t computed_crc);
 void debug_transfer_progress(const struct TransferStats *stats, const struct Packet *packet);
 void debug_sequence_error(const struct TransferStats *stats, uint8_t received_seq);
-void debug_retransmission(const struct TransferStats *stats, uint8_t seq, int attempt);
 
 #endif // DEBUG_H

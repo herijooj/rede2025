@@ -3,8 +3,7 @@
 #include "debug.h"
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <signal.h>
-#include <limits.h>
+#include <linux/limits.h> // Added for PATH_MAX
 #include <time.h>
 
 #define BACKUP_DIR "./backup/"
@@ -39,21 +38,16 @@ static int current_fd = -1;
 
 void handle_data_packet(int socket, Packet *packet, int fd, struct sockaddr_ll *addr, struct TransferStats *stats);
 void handle_backup(int socket, Packet *packet, struct sockaddr_ll *addr, struct TransferStats *stats);
-void handle_restore(int socket, Packet *packet, struct sockaddr_ll *addr);
-void handle_verify(int socket, Packet *packet, struct sockaddr_ll *addr);
 
 void display_help(const char* program_name) {
-    printf(BLUE "NARBS Server (Not A Real Backup Solution)\n" RESET);
-    printf(GREEN "Usage:\n" RESET);
-    printf("  %s <interface>\n\n", program_name);
-    printf(YELLOW "Description:\n" RESET);
-    printf("  Server component that handles:\n");
-    printf("  • File backup requests\n");
-    printf("  • File restoration requests\n");
-    printf("  • Backup verification requests\n\n");
-    printf(BLUE "Storage:\n" RESET);
-    printf("  Files are stored in: %s\n\n", BACKUP_DIR);
-    printf(YELLOW "Options:\n" RESET);
+    printf(BLUE "NARBS Server (Not A Real Backup Solution)\\n" RESET);
+    printf(GREEN "Usage:\\n" RESET);
+    printf("  %s <interface>\\n\\n", program_name);
+    printf(YELLOW "Description:\\n" RESET);
+    printf("  Server component that handles file backup requests\\n"); // Simplified description
+    printf(BLUE "Storage:\\n" RESET);
+    printf("  Files are stored in: %s\\n\\n", BACKUP_DIR);
+    printf(YELLOW "Options:\\n" RESET);
     printf("  -h        - Display this help message");
 }
 
@@ -164,164 +158,13 @@ void handle_backup(int socket, Packet *packet, struct sockaddr_ll *addr, struct 
     debug_transfer_progress(stats, packet);
 }
 
-static void reset_restore_context() {
-    if (restore_ctx.fd >= 0) {
-        close(restore_ctx.fd);
-    }
-    memset(&restore_ctx, 0, sizeof(RestoreContext));
-    restore_ctx.fd = -1;
-}
-
-void handle_restore(int socket, Packet *packet, struct sockaddr_ll *addr) {
-    DBG_INFO("Starting restore for file: %s\n", packet->data);
-    
-    // Reset context if it's a new request
-    if (strcmp(restore_ctx.filename, packet->data) != 0) {
-        reset_restore_context();
-        strncpy(restore_ctx.filename, packet->data, PATH_MAX - 1);
-    }
-
-    char filepath[PATH_MAX];
-    snprintf(filepath, sizeof(filepath), "%s%s", BACKUP_DIR, packet->data);
-
-    // Open file if not already open
-    if (restore_ctx.fd < 0) {
-        restore_ctx.fd = open(filepath, O_RDONLY);
-        if (restore_ctx.fd < 0) {
-            DBG_WARN("File not found in backup: %s\n", packet->data);
-            send_error(socket, addr, ERR_NOT_FOUND, true);
-            reset_restore_context();
-            return;
-        }
-
-        struct stat st;
-        if (fstat(restore_ctx.fd, &st) < 0) {
-            DBG_ERROR("Cannot stat file: %s\n", strerror(errno));
-            send_error(socket, addr, ERR_NO_ACCESS, true);
-            reset_restore_context();
-            return;
-        }
-        restore_ctx.file_size = st.st_size;
-        restore_ctx.bytes_sent = 0;
-        restore_ctx.sequence = 0;
-    }
-
-    DBG_INFO("Restore context - file: %s, size: %lu, sent: %lu\n",
-             restore_ctx.filename, restore_ctx.file_size, restore_ctx.bytes_sent);
-
-    // Send file size info
-    Packet size_packet = {0};
-    size_packet.start_marker = START_MARKER;
-    SET_TYPE(size_packet.size_seq_type, PKT_SIZE);
-    memcpy(size_packet.data, &restore_ctx.file_size, sizeof(uint64_t));
-    SET_SIZE(size_packet.size_seq_type, sizeof(uint64_t));
-    send_packet(socket, &size_packet, addr, true);
-
-    // Set socket timeout
-    if (set_socket_timeout(socket, SOCKET_TIMEOUT_MS) < 0) {
-        DBG_ERROR("Failed to set restore timeout\n");
-        send_error(socket, addr, ERR_TIMEOUT, true);
-        reset_restore_context();
-        return;
-    }
-
-    // Continue from where we left off
-    if (lseek(restore_ctx.fd, restore_ctx.bytes_sent, SEEK_SET) < 0) {
-        DBG_ERROR("Failed to seek to position %lu: %s\n", restore_ctx.bytes_sent, strerror(errno));
-        send_error(socket, addr, ERR_NO_ACCESS, true);
-        reset_restore_context();
-        return;
-    }
-
-    char buffer[MAX_DATA_SIZE];
-    ssize_t bytes;
-    current_state = STATE_RECEIVING;
-    time_t last_active = time(NULL);
-
-    while (restore_ctx.bytes_sent < restore_ctx.file_size) {
-        // Check for timeout
-        if (time(NULL) - last_active > ACTIVITY_TIMEOUT_SEC) {
-            DBG_WARN("Restore timeout, saving context\n");
-            current_state = STATE_IDLE;
-            return;
-        }
-
-        bytes = read(restore_ctx.fd, buffer, MAX_DATA_SIZE);
-        if (bytes <= 0) break;
-
-        Packet data = {0};
-        data.start_marker = START_MARKER;
-        SET_TYPE(data.size_seq_type, PKT_DATA);
-        SET_SEQUENCE(data.size_seq_type, restore_ctx.sequence);
-        SET_SIZE(data.size_seq_type, bytes);
-        memcpy(data.data, buffer, bytes);
-
-        int retries = 0;
-        bool chunk_sent = false;
-
-        while (retries < MAX_RETRIES && !chunk_sent) {
-            if (send_packet(socket, &data, addr, true) >= 0) {
-                Packet ack;
-                if (receive_packet(socket, &ack, addr, false) > 0 &&
-                    GET_TYPE(ack.size_seq_type) == PKT_OK &&
-                    GET_SEQUENCE(ack.size_seq_type) == restore_ctx.sequence) {
-                    
-                    restore_ctx.bytes_sent += bytes;
-                    restore_ctx.sequence = (restore_ctx.sequence + 1) & SEQ_NUM_MAX;
-                    chunk_sent = true;
-                    last_active = time(NULL);
-                    
-                    float progress = (float)restore_ctx.bytes_sent / restore_ctx.file_size * 100;
-                    DBG_INFO("Progress: %.1f%% (%lu/%lu bytes)\n",
-                            progress, restore_ctx.bytes_sent, restore_ctx.file_size);
-                }
-            }
-            if (!chunk_sent) {
-                retries++;
-                usleep(RETRY_DELAY_MS * 1000);
-            }
-        }
-
-        if (!chunk_sent) {
-            DBG_ERROR("Failed to send chunk after %d retries\n", MAX_RETRIES);
-            current_state = STATE_IDLE;
-            return;
-        }
-    }
-
-    // Send END_TX
-    Packet end_tx = {0};
-    end_tx.start_marker = START_MARKER;
-    SET_TYPE(end_tx.size_seq_type, PKT_END_TX);
-    SET_SEQUENCE(end_tx.size_seq_type, 0);
-    SET_SIZE(end_tx.size_seq_type, 0);
-    send_packet(socket, &end_tx, addr, true);
-
-    DBG_INFO("Restore completed successfully\n");
-    reset_restore_context();
-    current_state = STATE_IDLE;
-}
-
-void handle_verify(int socket, Packet *packet, struct sockaddr_ll *addr) {
-    DBG_INFO("Verifying file: %s\n", packet->data);
-    char filepath[PATH_MAX];
-    snprintf(filepath, sizeof(filepath), "%s%s", BACKUP_DIR, packet->data);
-
-    struct stat st;
-    if (stat(filepath, &st) == 0) {
-        send_ack(socket, addr, PKT_ACK, true);
-    } else {
-        send_error(socket, addr, ERR_NOT_FOUND, true);
-    }
-}
-
 static void reset_server_state() {
     if (current_fd >= 0) {
         close(current_fd);
         current_fd = -1;
     }
     current_state = STATE_IDLE;
-    DBG_INFO("Server state reset, ready for new transactions\n");
+    DBG_INFO("Server state reset, ready for new transactions\\n");
 }
 
 static bool check_timeout(time_t last_activity) {
@@ -346,8 +189,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc != 2) {
-        fprintf(stderr, RED "Error: Invalid number of arguments\n" RESET);
-        fprintf(stderr, "Use '%s -h' for help\n", argv[0]);
+        fprintf(stderr, RED "Error: Invalid number of arguments\\n" RESET);
+        fprintf(stderr, "Use '%s <interface>' or '%s -h' for help\\n", argv[0], argv[0]); // Simplified usage
         exit(1);
     }
 
@@ -355,7 +198,7 @@ int main(int argc, char *argv[]) {
 
     int socket_fd = cria_raw_socket(argv[1]);
     if (socket_fd < 0) {
-        fprintf(stderr, RED "Error: Could not create socket on interface %s\n" RESET, argv[1]);
+        fprintf(stderr, RED "Error: Could not create socket on interface %s\\n" RESET, argv[1]);
         exit(1);
     }
 
@@ -381,7 +224,7 @@ int main(int argc, char *argv[]) {
             switch (GET_TYPE(packet.size_seq_type)) {
                 case PKT_BACKUP:
                     if (current_state != STATE_IDLE) {
-                        DBG_WARN("Received backup request while busy, resetting state\n");
+                        DBG_WARN("Received backup request while busy, resetting state\\n");
                         reset_server_state();
                     }
                     current_state = STATE_RECEIVING;
@@ -392,7 +235,7 @@ int main(int argc, char *argv[]) {
 
                 case PKT_DATA:
                     if (current_state != STATE_RECEIVING || current_fd < 0) {
-                        DBG_WARN("Received data packet in invalid state, ignoring\n");
+                        DBG_WARN("Received data packet in invalid state, ignoring\\n");
                         send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
                         continue;
                     }
@@ -401,10 +244,10 @@ int main(int argc, char *argv[]) {
 
                 case PKT_END_TX:
                     if (current_state != STATE_RECEIVING || current_fd < 0) {
-                        DBG_WARN("Received END_TX in invalid state, ignoring\n");
+                        DBG_WARN("Received END_TX in invalid state, ignoring\\n");
                         continue;
                     }
-                    DBG_INFO("Received END_TX\n");
+                    DBG_INFO("Received END_TX\\n");
                     print_transfer_summary(&stats);
 
                     if (stats.total_received == stats.total_expected) {
@@ -415,33 +258,16 @@ int main(int argc, char *argv[]) {
                         SET_SIZE(end_tx_ack.size_seq_type, 0);
                         end_tx_ack.crc = calculate_crc(&end_tx_ack); // is_send = true
                         send_packet(socket_fd, &end_tx_ack, &client_addr, true);
-                        DBG_INFO("Transfer completed successfully\n");
+                        DBG_INFO("Transfer completed successfully\\n");
                     } else {
-                        DBG_ERROR("Incomplete transfer: %zu/%zu bytes\n", stats.total_received, stats.total_expected);
+                        DBG_ERROR("Incomplete transfer: %zu/%zu bytes\\n", stats.total_received, stats.total_expected);
                         send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
                     }
                     reset_server_state();
                     break;
 
-                case PKT_RESTORE:
-                    if (current_state != STATE_IDLE && 
-                        strcmp(restore_ctx.filename, packet.data) != 0) {
-                        send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
-                        break;
-                    }
-                    handle_restore(socket_fd, &packet, &client_addr);
-                    break;
-
-                case PKT_VERIFY:
-                    if (current_state != STATE_IDLE) {
-                        send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
-                        break;
-                    }
-                    handle_verify(socket_fd, &packet, &client_addr);
-                    break;
-
                 case PKT_ERROR:
-                    DBG_ERROR("Received error from client: code %d\n", packet.data[0]);
+                    DBG_ERROR("Received error from client: code %d\\n", packet.data[0]);
 
                     if (current_fd >= 0) {
                         close(current_fd);
@@ -452,13 +278,13 @@ int main(int argc, char *argv[]) {
 
                 default:
                     if (current_state != STATE_IDLE) {
-                        DBG_WARN("Timeout in non-idle state, resetting\n");
+                        DBG_WARN("Timeout in non-idle state, resetting\\n");
                         reset_server_state();
                     }
                     break;
             }
         } else if (recv_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            DBG_ERROR("Receive error: %s\n", strerror(errno));
+            DBG_ERROR("Receive error: %s\\n", strerror(errno));
             if (current_state != STATE_IDLE) {
                 reset_server_state();
             }

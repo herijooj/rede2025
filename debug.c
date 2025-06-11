@@ -107,8 +107,6 @@ const char* packet_type_to_string(uint8_t type) {
         case PKT_DATA:      return "DATA";
         case PKT_END_TX:    return "END_TX";
         case PKT_ERROR:     return "ERROR";
-        case PKT_RESTORE:   return "RESTORE";
-        case PKT_VERIFY:    return "VERIFY";
         case PKT_ACK:       return "ACK";
         default:            return "UNKNOWN";
     }
@@ -153,14 +151,9 @@ void debug_transfer_progress(const struct TransferStats *stats, const struct Pac
 }
 
 void debug_sequence_error(const struct TransferStats *stats, uint8_t received_seq) {
-    DBG_ERROR("Seq err: exp=%u got=%u last=%u (errs=%u)\n",
+    DBG_ERROR("Seq err: exp=%u got=%u last=%u (errs=%u)\\n",
              stats->expected_seq, received_seq, 
              stats->last_sequence, stats->sequence_errors);
-}
-
-void debug_retransmission(const struct TransferStats *stats, uint8_t seq, int attempt) {
-    DBG_WARN("Retry: seq=%u try=%d/%d (total=%u)\n",
-             seq, attempt, MAX_RETRIES, stats->retransmissions);
 }
 
 void transfer_init_stats(struct TransferStats *stats, size_t expected_size) {
@@ -170,20 +163,16 @@ void transfer_init_stats(struct TransferStats *stats, size_t expected_size) {
     stats->last_sequence = 0; // Explicitly initialize last sequence
 }
 
-void transfer_handle_wrap(struct TransferStats *stats) {
-    stats->wrap_count++;
-    stats->total_sequences = (uint64_t)stats->wrap_count * (SEQ_NUM_MAX + 1) + stats->last_sequence;
-    DBG_INFO("Sequence wrapped around (count: %u, total sequences: %lu)\n", 
-             stats->wrap_count, stats->total_sequences);
-}
-
 void transfer_update_stats(struct TransferStats *stats, size_t bytes, uint8_t seq) {
     // Don't update total_received here - let the caller handle it
     stats->packets_processed++;
     
-    // Check for wrap-around
+    // Check for wrap-around (simplified)
     if (seq < stats->last_sequence && stats->last_sequence > SEQ_NUM_MAX/2) {
-        transfer_handle_wrap(stats);
+        stats->wrap_count++;
+        stats->total_sequences = (uint64_t)stats->wrap_count * (SEQ_NUM_MAX + 1) + stats->last_sequence;
+        DBG_INFO("Sequence wrapped around (count: %u, total sequences: %lu)\\n", 
+                 stats->wrap_count, stats->total_sequences);
     }
     
     stats->last_sequence = seq;
@@ -217,7 +206,7 @@ void print_transfer_summary(const struct TransferStats *stats) {
 bool transfer_is_duplicate(const struct TransferStats *stats, uint8_t seq)
 {
     if (seq == stats->last_sequence) {
-        DBG_WARN("Duplicate packet received: seq=%u\n", seq);
+        DBG_WARN("Duplicate packet received: seq=%u\\n", seq);
         return true;
     }
     return false;

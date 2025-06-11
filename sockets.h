@@ -28,8 +28,6 @@ typedef enum {
     PKT_OK        = 0x02,  // OK
     PKT_ACK       = 0x03,  // Acknowledgment
     PKT_BACKUP    = 0x04,  // Backup request
-    PKT_RESTORE   = 0x05,  // Restore request
-    PKT_VERIFY    = 0x06,  // Verify request
     PKT_OK_CHSUM  = 0x0D,  // OK + Checksum
     PKT_OK_SIZE   = 0x0E,  // OK + Size
     PKT_SIZE      = 0x0F,  // Size info
@@ -161,10 +159,8 @@ int get_interface_info(int socket, char *interface, struct sockaddr_ll *addr);
 int cria_raw_socket(char *nome_interface_rede);
 int validate_packet(Packet *packet, bool is_send);
 int validate_packet_fields(Packet *packet);
-uint8_t calculate_crc_robust(const Packet *packet, bool is_send);
 int validate_crc(const Packet *packet);
 void init_packet_sequence(struct Packet *packet);
-int validate_sequence_order(uint8_t received, uint8_t expected);
 
 struct PacketStats {
     uint64_t total_bytes;       // Changed from size_t
