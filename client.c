@@ -33,7 +33,7 @@ void init_client(ClientState *client);
 void display_grid(const ClientState *client);
 int send_movement(ClientState *client, PacketType move_type);
 void process_server_packet(ClientState *client, const Packet *pkt);
-int receive_file_transfer(ClientState *client);
+int receive_file_transfer(ClientState *client, uint32_t file_size, uint8_t initial_seq);
 void handle_treasure_file(const char *filename, PacketType file_type);
 char get_user_input(void);
 void setup_terminal(void);
@@ -254,7 +254,16 @@ void process_server_packet(ClientState *client, const Packet *pkt) {
             
             printf("Move successful! Treasure discovered at (%d,%d)! Receiving file...\n", 
                    client->player_x, client->player_y);
-            receive_file_transfer(client);
+
+            // Extract file size and the starting sequence number from the packet
+            uint32_t file_size = 0;
+            if (pkt->size >= sizeof(uint32_t)) {
+                memcpy(&file_size, pkt->data, sizeof(uint32_t));
+                file_size = ntohl(file_size);
+            }
+            
+            // Call the modified receive_file_transfer function
+            receive_file_transfer(client, file_size, pkt->seq);
             break;
             
         default:
@@ -263,88 +272,84 @@ void process_server_packet(ClientState *client, const Packet *pkt) {
     }
 }
 
-int receive_file_transfer(ClientState *client) {
+int receive_file_transfer(ClientState *client, uint32_t file_size, uint8_t initial_seq) {
     char filename[64] = {0};
     char filepath[128] = {0};
     PacketType file_type = PKT_TEXT_ACK;
-    uint32_t file_size = 0;
     uint32_t bytes_received = 0;
     FILE *file = NULL;
-    
-    // Receive packets until end of file using proper stop-and-wait protocol
+
+    // The sequence number of the next packet we expect is the one after PKT_SIZE
+    uint8_t expected_seq = (initial_seq + 1) & 0x1F; // & 0x1F wraps it for 5 bits
+
+    printf("File size: %u bytes\n", file_size);
+    // Check disk space
+    if (!check_disk_space(RECEIVED_FILES_DIR, file_size)) {
+        printf("Error: Insufficient disk space!\n");
+        // NOTE: The protocol lacks a way to tell the server to abort here.
+        return -1;
+    }
+
     Packet pkt;
     while (1) {
         ssize_t received = receive_packet(client->socket_fd, &pkt, &client->server_addr);
-        if (received <= 0) continue;
-        
-        switch (pkt.type) {
-            case PKT_SIZE:
-                // File size packet
-                if (pkt.size >= sizeof(uint32_t)) {
-                    memcpy(&file_size, pkt.data, sizeof(uint32_t));
-                    file_size = ntohl(file_size);
-                    printf("File size: %u bytes\n", file_size);
-                    
-                    // Check disk space
-                    if (!check_disk_space(RECEIVED_FILES_DIR, file_size)) {
-                        printf("Error: Insufficient disk space!\n");
+        if (received <= 0) {
+            printf("Receive timeout, retrying...\n");
+            continue;
+        }
+
+        // Check if the received packet is the one we are waiting for
+        if (pkt.seq == expected_seq) {
+            // It's the correct packet, process it
+            switch (pkt.type) {
+                case PKT_TEXT_ACK:
+                case PKT_VIDEO_ACK:
+                case PKT_IMAGE_ACK:
+                    file_type = pkt.type;
+                    strncpy(filename, (char*)pkt.data, pkt.size);
+                    filename[pkt.size] = '\0';
+                    snprintf(filepath, sizeof(filepath), "%s/%s", RECEIVED_FILES_DIR, filename);
+                    file = fopen(filepath, "wb");
+                    if (!file) {
+                        printf("Error: Could not create file %s\n", filepath);
                         return -1;
                     }
-                }
-                break;
-                
-            case PKT_TEXT_ACK:
-            case PKT_VIDEO_ACK:
-            case PKT_IMAGE_ACK:
-                // Filename packet
-                file_type = pkt.type;
-                strncpy(filename, (char*)pkt.data, pkt.size);
-                filename[pkt.size] = '\0';
-                snprintf(filepath, sizeof(filepath), "%s/%s", RECEIVED_FILES_DIR, filename);
-                
-                file = fopen(filepath, "wb");
-                if (!file) {
-                    printf("Error: Could not create file %s\n", filepath);
-                    return -1;
-                }
-                printf("Receiving: %s\n", filename);
-                break;
-                
-            case PKT_DATA:
-                // File data packet
-                if (file && pkt.size > 0) {
-                    fwrite(pkt.data, 1, pkt.size, file);
-                    bytes_received += pkt.size;
-                    printf("Received %u/%u bytes\r", bytes_received, file_size);
-                    fflush(stdout);
-                }
-                break;
-                
-            case PKT_END_FILE:
-                // End of file transfer
-                if (file) {
-                    fclose(file);
-                    file = NULL;
-                }
-                printf("\nFile transfer completed: %s\n", filename);
-                
-                // Mark treasure on grid
-                client->grid[client->player_y][client->player_x].has_treasure = 1;
-                strncpy(client->grid[client->player_y][client->player_x].treasure_name, 
-                       filename, sizeof(client->grid[client->player_y][client->player_x].treasure_name) - 1);
-                client->treasures_found++;
-                
-                // Handle the treasure file
-                handle_treasure_file(filepath, file_type);
-                return 0;
-                
-            default:
-                break;
+                    printf("Receiving: %s\n", filename);
+                    break;
+                case PKT_DATA:
+                    if (file && pkt.size > 0) {
+                        fwrite(pkt.data, 1, pkt.size, file);
+                        bytes_received += pkt.size;
+                        printf("Received %u/%u bytes\r", bytes_received, file_size);
+                        fflush(stdout);
+                    }
+                    break;
+                case PKT_END_FILE:
+                    if (file) {
+                        fclose(file);
+                        file = NULL;
+                    }
+                    printf("\nFile transfer completed: %s\n", filename);
+                    client->grid[client->player_y][client->player_x].has_treasure = 1;
+                    strncpy(client->grid[client->player_y][client->player_x].treasure_name, 
+                           filename, sizeof(client->grid[client->player_y][client->player_x].treasure_name) - 1);
+                    client->treasures_found++;
+                    handle_treasure_file(filepath, file_type);
+                    return 0; // Success, exit loop and function
+                default:
+                     printf("Received unexpected packet type %d with correct sequence.\n", pkt.type);
+                    break;
+            }
+            // Increment to the next expected sequence number
+            expected_seq = (expected_seq + 1) & 0x1F;
+        } else {
+            // This is a duplicate or old packet.
+            // receive_packet() already sent an ACK for it. We just ignore it and wait for the correct one.
+            printf("\nIgnoring out-of-sequence packet. Expected: %u, Got: %u\n", expected_seq, pkt.seq);
         }
     }
-    
     if (file) fclose(file);
-    return -1;
+    return -1; // Should not be reached
 }
 
 void handle_treasure_file(const char *filename, PacketType file_type) {

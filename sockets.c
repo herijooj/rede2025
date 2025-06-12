@@ -161,6 +161,7 @@ int send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr) {
                 
                 if (ack.start_marker == START_MARKER &&
                     ack.type == PKT_ACK &&
+                    ack.seq == pkt->seq && // Add sequence number validation
                     validate_packet(&ack)) {
                     return 0;  // Success
                 }

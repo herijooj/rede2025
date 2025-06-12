@@ -13,8 +13,8 @@ sudo ip link set veth1 up
 ## Run server on one virtual interface
 sudo ./server veth0
 
-## Run client on the other virtual interface
-sudo ./client veth1 backup file.txt
+## Run client on the other virtual interface (interactive treasure hunt game)
+sudo ./client veth1
 
 ---
 # Rodando em 2 pcs.
@@ -27,8 +27,8 @@ sudo ip link set eno1 up
 sudo ip addr add 192.168.1.2/24 dev eno1
 sudo ip link set eno1 up
 
-## Run server on one 
+## Run server on one machine
 sudo ./server eno1
 
-## Run client on the other
-sudo ./client eno backup file.txt
+## Run client on the other machine (interactive treasure hunt game)
+sudo ./client eno1

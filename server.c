@@ -86,7 +86,7 @@ int main(int argc, char *argv[]) {
                 // Update client address for responses
                 game.client_addr = client_addr;
                 process_client_packet(&game, &pkt);
-                display_server_state(&game);
+                // Removed display_server_state() call - now handled inside process_client_packet()
             }
         }
     }
@@ -207,10 +207,18 @@ int count_undiscovered(const GameState *game) {
 }
 
 void process_client_packet(GameState *game, const Packet *pkt) {
+    int state_changed = 0;  // Track if game state actually changed
+    
     switch (pkt->type) {
+        case PKT_ACK:
+            // ACK packets are normal during file transfers - just ignore them silently
+            // They are handled by the send_packet() function's stop-and-wait mechanism
+            break;
+            
         case PKT_MOVE_RIGHT:
             if (handle_movement(game, PKT_MOVE_RIGHT)) {
                 log_movement(game, "RIGHT");
+                state_changed = 1;  // Player moved
                 // Check for treasure first, then send appropriate response
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
@@ -224,6 +232,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
         case PKT_MOVE_LEFT:
             if (handle_movement(game, PKT_MOVE_LEFT)) {
                 log_movement(game, "LEFT");
+                state_changed = 1;  // Player moved
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
                     send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
@@ -236,6 +245,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
         case PKT_MOVE_UP:
             if (handle_movement(game, PKT_MOVE_UP)) {
                 log_movement(game, "UP");
+                state_changed = 1;  // Player moved
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
                     send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
@@ -248,6 +258,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
         case PKT_MOVE_DOWN:
             if (handle_movement(game, PKT_MOVE_DOWN)) {
                 log_movement(game, "DOWN");
+                state_changed = 1;  // Player moved
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
                     send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
@@ -261,6 +272,11 @@ void process_client_packet(GameState *game, const Packet *pkt) {
             printf("Received unknown packet type: %d\n", pkt->type);
             send_ack(game->socket_fd, &game->client_addr, PKT_NACK);
             break;
+    }
+    
+    // Only update display if game state actually changed
+    if (state_changed) {
+        display_server_state(game);
     }
 }
 
@@ -335,7 +351,7 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     
     printf("Sending file: %s (%ld bytes)\n", filepath, st.st_size);
     
-    // Send file size using proper stop-and-wait
+    // Send file size - use simple sendto to sync with client's main loop recvfrom
     Packet size_pkt = {
         .start_marker = START_MARKER,
         .size = sizeof(uint32_t),
@@ -346,7 +362,11 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     memcpy(size_pkt.data, &file_size, sizeof(uint32_t));
     size_pkt.checksum = calculate_crc(&size_pkt);
     
-    if (send_packet(game->socket_fd, &size_pkt, &game->client_addr) < 0) {
+    // Send the first packet (PKT_SIZE) without stop-and-wait to sync with the client's main loop
+    PacketRaw raw_size_pkt;
+    pack_packet(&size_pkt, &raw_size_pkt);
+    if (sendto(game->socket_fd, &raw_size_pkt, sizeof(PacketRaw), 0, (struct sockaddr *)&game->client_addr, sizeof(game->client_addr)) < 0) {
+        perror("sendto for PKT_SIZE failed");
         fclose(file);
         return -1;
     }
