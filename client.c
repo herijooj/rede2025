@@ -1,525 +1,443 @@
-// client.c
 #include "sockets.h"
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <stdbool.h>
-#include <ctype.h>
-#include <limits.h>
-#include <errno.h>
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <termios.h>
+#include <sys/statvfs.h>
+#include <sys/stat.h>
+#include <errno.h>
 
-// Command types
-typedef enum {
-    CMD_INVALID = 0,
-    CMD_BACKUP,
-    CMD_RESTORE,
-    CMD_VERIFY
-} ClientCommand;
+#define GRID_SIZE 8
+#define RECEIVED_FILES_DIR "./received"
 
-// Client context structure
 typedef struct {
-    int socket;
-    ClientCommand cmd;
-    char filename[PATH_MAX];
-    struct sockaddr_ll addr;
-} ClientContext;
+    int x, y;
+    int visited;
+    int has_treasure;
+    char treasure_name[64];
+} GridCell;
 
-// Function declarations
-void display_help(const char* program_name);
-int read_mac_from_config(const char* filename, unsigned char* mac);
+typedef struct {
+    int player_x, player_y;
+    GridCell grid[GRID_SIZE][GRID_SIZE];
+    int socket_fd;
+    struct sockaddr_ll server_addr;
+    uint8_t seq_num;
+    int treasures_found;
+    PacketType pending_move; // Track the pending move
+} ClientState;
 
+// Function prototypes
+void init_client(ClientState *client);
+void display_grid(const ClientState *client);
+int send_movement(ClientState *client, PacketType move_type);
+void process_server_packet(ClientState *client, const Packet *pkt);
+int receive_file_transfer(ClientState *client);
+void handle_treasure_file(const char *filename, PacketType file_type);
+char get_user_input(void);
+void setup_terminal(void);
+void restore_terminal(void);
+int check_disk_space(const char *path, size_t required_space);
+void create_received_dir(void);
 
-static ClientCommand parse_command(const char *cmd_str) {
-    if (strcmp(cmd_str, "backup") == 0) return CMD_BACKUP;
-    if (strcmp(cmd_str, "restaura") == 0) return CMD_RESTORE;
-    if (strcmp(cmd_str, "verifica") == 0) return CMD_VERIFY;
-    return CMD_INVALID;
-}
-
-// Initialize client context
-static void init_client_context(ClientContext *ctx, int socket, char *filename, ClientCommand cmd) {
-    memset(ctx, 0, sizeof(ClientContext));
-    ctx->socket = socket;
-    ctx->cmd = cmd;
-    strncpy(ctx->filename, filename, PATH_MAX - 1);
-}
-
-void backup_file(int socket, char *filename, struct sockaddr_ll *addr);
-int restore_file(int socket, char *filename, struct sockaddr_ll *addr);
-void verify_file(int socket, char *filename, struct sockaddr_ll *addr);
-
-void display_help(const char* program_name) {
-    printf(BLUE "NARBS Client (Not A Real Backup Solution)\n" RESET);
-    printf(GREEN "Usage:\n" RESET);
-    printf("  %s <interface> <command> <filename>\n\n", program_name);
-    printf(YELLOW "Commands:\n" RESET);
-    printf("  backup    - Create a backup of a file\n");
-    printf("  restaura  - Restore a file from backup\n");
-    printf("  verifica  - Verify if a file exists in backup\n\n");
-    printf(YELLOW "Options:\n" RESET);
-    printf("  -h        - Display this help message");
-}
-
-int parse_mac_address(const char *mac_str, unsigned char *mac_addr) {
-    int values[6];
-    if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
-               &values[0], &values[1], &values[2],
-               &values[3], &values[4], &values[5]) != 6) {
-        return -1;
-    }
-    for (int i = 0; i < 6; i++) {
-        if (values[i] < 0 || values[i] > 255) {
-            return -1;
-        }
-        mac_addr[i] = (unsigned char)values[i];
-    }
-    return 0;
-}
-
-int read_mac_from_config(const char *config_file, unsigned char *mac_addr) {
-    FILE *file = fopen(config_file, "r");
-    if (!file) {
-        DBG_ERROR("Cannot open config file %s: %s\n", config_file, strerror(errno));
-        return -1;
-    }
-    char line[256];
-    char mac_str[18] = {0};
-    while (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "server_mac=%17s", mac_str) == 1) {
-            fclose(file);
-            return parse_mac_address(mac_str, mac_addr);
-        }
-    }
-    fclose(file);
-    return -1;
-}
-void backup_file(int socket, char *filename, struct sockaddr_ll *addr) {
-    DBG_INFO("Starting backup of %s\n", filename);
-
-    char resolved_path[PATH_MAX];
-    if (realpath(filename, resolved_path) == NULL) {
-        DBG_ERROR("Cannot resolve file path %s: %s\n", filename, strerror(errno));
-        fprintf(stderr, "Error: Invalid file path '%s': %s\n", filename, strerror(errno));
-        return;
-    }
-
-    char *base_filename = strrchr(resolved_path, '/');
-    if (base_filename) {
-        base_filename++;
-    } else {
-        base_filename = resolved_path;
-    }
-
-    int fd = open(resolved_path, O_RDONLY);
-    if (fd < 0) {
-        DBG_ERROR("Cannot open file %s: %s\n", resolved_path, strerror(errno));
-        fprintf(stderr, "Error: Cannot open file '%s' for reading: %s\n", resolved_path, strerror(errno));
-        return;
-    }
-
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        DBG_ERROR("Cannot stat file: %s\n", strerror(errno));
-        close(fd);
-        return;
-    }
-
-    uint64_t total_size = st.st_size;
-    DBG_INFO("File size: %lu bytes\n", total_size);
-
-    struct TransferStats stats;
-    transfer_init_stats(&stats, total_size);
-    size_t total_chunks = (total_size + MAX_DATA_SIZE - 1) / MAX_DATA_SIZE;
-    DBG_INFO("File will be sent in %zu chunks\n", total_chunks);
-
-    Packet packet = {0};
-    memset(packet.padding, 0, PAD_SIZE);
-    packet.start_marker = START_MARKER;
-    SET_TYPE(packet.size_seq_type, PKT_BACKUP);
-    SET_SEQUENCE(packet.size_seq_type, 0);
-    SET_SIZE(packet.size_seq_type, strlen(base_filename) + 1 + sizeof(size_t));
-
-    size_t max_filename_len = MAX_DATA_SIZE - sizeof(size_t) - 1;
-    if (strlen(base_filename) >= max_filename_len) {
-        DBG_ERROR("Filename too long (max %zu chars): %s\n", max_filename_len - 1, base_filename);
-        fprintf(stderr, "Error: Filename exceeds maximum length\n");
-        close(fd);
-        return;
-    }
-    
-    memset(packet.data, 0, MAX_DATA_SIZE);
-    memcpy(packet.data, base_filename, strlen(base_filename));
-    *((size_t *)(packet.data + strlen(base_filename) + 1)) = total_size;
-
-    if (send_packet(socket, &packet, addr, true) < 0 ||
-        wait_for_ack(socket, &packet, addr, PKT_ACK) != 0 ||
-        wait_for_ack(socket, &packet, addr, PKT_OK_SIZE) != 0) {
-        DBG_ERROR("Failed to initialize backup\n");
-        close(fd);
-        return;
-    }
-
-    char buffer[MAX_DATA_SIZE];
-    uint8_t seq = 0;
-    Packet data_packet = {0}; // Initialize outside the loop
-
-    while (stats.total_received < total_size) {
-        uint64_t to_read = total_size - stats.total_received;
-        if (to_read > MAX_DATA_SIZE) {
-            to_read = MAX_DATA_SIZE;
-        }
-        
-        ssize_t bytes = read(fd, buffer, to_read);
-        if (bytes <= 0) {
-            DBG_ERROR("Read error: %s\n", strerror(errno));
-
-            Packet error_packet = {0};
-            error_packet.start_marker = START_MARKER;
-            SET_TYPE(error_packet.size_seq_type, PKT_ERROR);
-            SET_SIZE(error_packet.size_seq_type, 1);
-            error_packet.data[0] = ERR_NO_ACCESS;
-            send_packet(socket, &error_packet, addr, true);
-
-            close(fd);
-            return;
-        }
-
-        if (bytes > MAX_DATA_SIZE) {
-            DBG_ERROR("Read more bytes than allowed: %zd\n", bytes);
-            close(fd);
-            return;
-        }
-
-        if (stats.total_received + bytes > total_size) {
-            DBG_ERROR("Attempting to send more data than total size\n");
-            close(fd);
-            return;
-        }
-
-        if (seq > SEQ_NUM_MAX) {
-            DBG_ERROR("Sequence number overflow\n");
-            close(fd);
-            return;
-        }
-
-        size_t remaining = total_size - stats.total_received;
-        DBG_INFO("Preparing chunk: seq=%d, size=%zd, remaining=%zu\n",
-                 seq, bytes, remaining);
-
-        int retries = 0;
-        bool chunk_sent = false;
-
-        while (retries < MAX_RETRIES && !chunk_sent) {
-            // Prepare data packet
-            memset(&data_packet, 0, sizeof(Packet));
-            data_packet.start_marker = START_MARKER;
-            SET_TYPE(data_packet.size_seq_type, PKT_DATA);
-            SET_SEQUENCE(data_packet.size_seq_type, seq);
-            SET_SIZE(data_packet.size_seq_type, bytes & SIZEFIELD_MAX);
-            memcpy(data_packet.data, buffer, bytes);
-            memset(data_packet.padding, 0, PAD_SIZE);
-            
-            // Send data packet with is_send = true
-            if (send_packet(socket, &data_packet, addr, true) >= 0) {
-                // Wait for ACK or ERROR with is_send = false
-                if (receive_packet(socket, &packet, addr, false) > 0) {
-                    uint8_t received_type = GET_TYPE(packet.size_seq_type);
-                    if (received_type == PKT_OK) {
-                        uint8_t received_seq = GET_SEQUENCE(packet.size_seq_type);
-                        if (received_seq == seq) {
-                            // Update stats first with actual bytes sent
-                            stats.total_received += bytes;
-                            transfer_update_stats(&stats, 0, seq);  // Don't add bytes here
-                            
-                            seq = (seq + 1) & SEQ_NUM_MAX;
-                            chunk_sent = true;
-                            
-                            // Update and display progress
-                            debug_transfer_progress(&stats, &data_packet);
-                        } else {
-                            // Unexpected sequence number
-                            DBG_WARN("Unexpected ACK sequence: expected %d, got %d\n", seq, received_seq);
-                            retries++;
-                            usleep(RETRY_DELAY_MS * 1000);
-                        }
-                    } else if (received_type == PKT_ERROR) {
-                        DBG_ERROR("Server error code=%d seq=%u size=%u\n",
-                                 packet.data[0], 
-                                 GET_SEQUENCE(packet.size_seq_type),
-                                 GET_SIZE(packet.size_seq_type));
-                        DBG_WARN("Received ERROR, retransmitting seq=%d\n", seq);
-                        retries++;
-                        usleep(RETRY_DELAY_MS * 1000);
-                    } else {
-                        // Unexpected packet type, ignore and retry
-                        DBG_WARN("Unexpected packet type=%d, retrying seq=%d\n", received_type, seq);
-                        retries++;
-                        usleep(RETRY_DELAY_MS * 1000);
-                    }
-                } else {
-                    // No response, treat as timeout
-                    retries++;
-                    DBG_WARN("No response, retrying seq=%d (%d/%d)\n", seq, retries, MAX_RETRIES);
-                    usleep(RETRY_DELAY_MS * 1000);
-                }
-                
-                // Add progress debugging
-                debug_transfer_progress(&stats, &data_packet);
-            } else {
-                // Send failed, increment retries
-                retries++;
-                DBG_WARN("Failed to send packet, retrying seq=%d (%d/%d)\n", seq, retries, MAX_RETRIES);
-                usleep(RETRY_DELAY_MS * 1000);
-            }
-        }
-
-        if (!chunk_sent) {
-            DBG_ERROR("Failed to send chunk seq=%d after %d retries\n", seq, MAX_RETRIES);
-            close(fd);
-            return;
-        }
-    }
-
-    if (stats.total_received == total_size) {
-        DBG_INFO("All chunks sent successfully, sending END_TX\n");
-        Packet end_packet = {0};
-        end_packet.start_marker = START_MARKER;
-        SET_TYPE(end_packet.size_seq_type, PKT_END_TX);
-        SET_SEQUENCE(end_packet.size_seq_type, 0);
-        SET_SIZE(end_packet.size_seq_type, 0);
-        end_packet.crc = calculate_crc(&end_packet); // is_send = true
-
-        int retries = 0;
-        bool end_tx_sent = false;
-        while (retries < MAX_RETRIES && !end_tx_sent) {
-            if (send_packet(socket, &end_packet, addr, true) >= 0 &&
-                wait_for_ack(socket, &end_packet, addr, PKT_OK_CHSUM) == 0) {
-                print_transfer_summary(&stats);
-                DBG_INFO("Transfer completed successfully\n");
-                end_tx_sent = true;
-            } else {
-                retries++;
-                DBG_WARN("Retrying END_TX (attempt %d/%d)\n", retries, MAX_RETRIES);
-                usleep(RETRY_DELAY_MS * 1000);
-            }
-        }
-
-        if (!end_tx_sent) {
-            DBG_ERROR("Failed to send END_TX after %d retries\n", MAX_RETRIES);
-        }
-    } else {
-        DBG_ERROR("Transfer incomplete, not sending END_TX\n");
-    }
-
-    close(fd);
-}
-
-int restore_file(int socket, char *filename, struct sockaddr_ll *addr) {
-    DBG_INFO("Starting restore of %s\n", filename);
-
-    Packet packet = {0};
-    memset(packet.padding, 0, PAD_SIZE);
-    packet.start_marker = START_MARKER;
-    SET_TYPE(packet.size_seq_type, PKT_RESTORE);
-    SET_SEQUENCE(packet.size_seq_type, 0);
-    SET_SIZE(packet.size_seq_type, strlen(filename));
-    strncpy(packet.data, filename, MAX_DATA_SIZE - 1);
-    packet.data[MAX_DATA_SIZE - 1] = '\0';
-    send_packet(socket, &packet, addr, true);  // Add is_send = true
-
-    if (receive_packet(socket, &packet, addr, false) > 0) {  // Add is_send = false
-        if (GET_TYPE(packet.size_seq_type) == PKT_ERROR) {
-            DBG_ERROR("Server rejected restore: %s (code=%d)\n",
-                     filename, packet.data[0]);
-            if (packet.data[0] == ERR_NOT_FOUND) {
-                fprintf(stderr, RED "Error: File '%s' not found in backup\n" RESET, filename);
-            } else {
-                fprintf(stderr, RED "Error: Server returned error code %d\n" RESET, packet.data[0]);
-            }
-            return 1;
-        }
-        
-        if (GET_TYPE(packet.size_seq_type) == PKT_SIZE) {
-            uint64_t total_size = *((uint64_t *)packet.data);
-            DBG_INFO("File size to restore: %lu bytes\n", total_size);
-
-            struct TransferStats stats;
-            transfer_init_stats(&stats, total_size);
-            stats.expected_seq = 0; // Explicitly initialize expected sequence
-
-            int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-            if (fd < 0) {
-                DBG_ERROR("Cannot create file %s: %s\n", filename, strerror(errno));
-                return 1;
-            }
-
-            while (stats.total_received < total_size) {
-                if (receive_packet(socket, &packet, addr, false) <= 0) {
-                    fprintf(stderr, "No response from server\n");
-                    close(fd);
-                    return 1;
-                }
-                debug_packet("RX", &packet);
-                
-                if (GET_TYPE(packet.size_seq_type) == PKT_DATA) {
-                    uint8_t recv_seq = GET_SEQUENCE(packet.size_seq_type);
-                    size_t data_size = GET_SIZE(packet.size_seq_type);
-                    
-                    // Only update stats if sequence is valid
-                    if (recv_seq == stats.expected_seq || 
-                        (recv_seq == 0 && stats.expected_seq == SEQ_NUM_MAX)) {
-                        
-                        if (write(fd, packet.data, data_size) < 0) {
-                            fprintf(stderr, "Write error\n");
-                            close(fd);
-                            return 1;
-                        }
-
-                        // Update total received bytes first
-                        stats.total_received += data_size;
-                        // Then update sequence tracking
-                        transfer_update_stats(&stats, 0, recv_seq); // Don't add bytes here since we did it above
-                        
-                        float progress = (float)(stats.total_received * 100.0) / total_size;
-                        DBG_INFO("Progress: %.1f%% (%lu/%lu bytes)\n",
-                                 progress, stats.total_received, total_size);
-
-                        // Send ACK with received sequence number
-                        Packet ack = {0};
-                        ack.start_marker = START_MARKER;
-                        SET_TYPE(ack.size_seq_type, PKT_OK);
-                        SET_SEQUENCE(ack.size_seq_type, recv_seq);
-                        SET_SIZE(ack.size_seq_type, 0);
-                        ack.crc = calculate_crc(&ack);
-                        send_packet(socket, &ack, addr, true);
-                        
-                    } else {
-                        debug_sequence_error(&stats, recv_seq);
-                        // Don't update stats for invalid sequence
-                        continue;
-                    }
-                } else if (GET_TYPE(packet.size_seq_type) == PKT_END_TX) {
-                    if (stats.total_received == total_size) {
-                        print_transfer_summary(&stats);
-                        DBG_INFO("Transfer completed successfully\n");
-                        close(fd);
-                        return 0;
-                    } else {
-                        DBG_ERROR("Received END_TX but transfer incomplete (%lu/%lu bytes)\n",
-                                 stats.total_received, total_size);
-                        close(fd);
-                        return 1;
-                    }
-                }
-            }
-
-            // Wait for final END_TX
-            int retries = 0;
-            while (retries < MAX_RETRIES) {
-                if (receive_packet(socket, &packet, addr, false) > 0) {
-                    if (GET_TYPE(packet.size_seq_type) == PKT_END_TX) {
-                        print_transfer_summary(&stats);
-                        DBG_INFO("Transfer completed successfully\n");
-                        close(fd);
-                        return 0;
-                    }
-                }
-                retries++;
-                usleep(RETRY_DELAY_MS * 1000);
-            }
-
-            DBG_ERROR("Never received END_TX packet\n");
-            close(fd);
-            return 1;
-        }
-    }
-
-    fprintf(stderr, RED "Error: No valid response from server\n" RESET);
-    return 1;
-}
-
-void verify_file(int socket, char *filename, struct sockaddr_ll *addr) {
-    DBG_INFO("Verifying %s\n", filename);
-
-    Packet packet = {0};
-    memset(packet.padding, 0, PAD_SIZE);
-    packet.start_marker = START_MARKER;
-    SET_TYPE(packet.size_seq_type, PKT_VERIFY);
-    SET_SEQUENCE(packet.size_seq_type, 0);
-    SET_SIZE(packet.size_seq_type, strlen(filename));
-    strncpy(packet.data, filename, MAX_DATA_SIZE - 1);
-    packet.data[MAX_DATA_SIZE - 1] = '\0';
-    send_packet(socket, &packet, addr, true);  // Add is_send = true
-
-    if (receive_packet(socket, &packet, addr, false) > 0) {  // Add is_send = false
-        if (GET_TYPE(packet.size_seq_type) == PKT_ACK) {
-            printf("File exists in backup\n");
-        } else if (GET_TYPE(packet.size_seq_type) == PKT_ERROR) {
-            printf("File not found in backup\n");
-        }
-    } else {
-        fprintf(stderr, "No response from server\n");
-    }
-}
+static struct termios old_termios;
 
 int main(int argc, char *argv[]) {
-    debug_init();
-    debug_init_error_log("client");
-
-    if (argc == 2 && strcmp(argv[1], "-h") == 0) {
-        display_help(argv[0]);
-        return 0;
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <interface>\n", argv[0]);
+        return 1;
     }
 
-    if (argc != 4) {
-        fprintf(stderr, RED "Error: Invalid number of arguments\n" RESET);
-        fprintf(stderr, "Use '%s -h' for help\n", argv[0]);
-        exit(1);
+    ClientState client = {0};
+    
+    // Create received files directory
+    create_received_dir();
+    
+    // Create raw socket
+    client.socket_fd = create_raw_socket(argv[1]);
+    if (client.socket_fd < 0) {
+        fprintf(stderr, "Failed to create raw socket\n");
+        return 1;
     }
 
-    int socket_fd = cria_raw_socket(argv[1]);
-    struct sockaddr_ll addr;
-    if (get_interface_info(socket_fd, argv[1], &addr) < 0) {
-        exit(1);
+    // Get interface info
+    if (get_interface_info(client.socket_fd, argv[1], &client.server_addr) < 0) {
+        close(client.socket_fd);
+        return 1;
     }
 
-    unsigned char server_mac[ETH_ALEN];
-    if (read_mac_from_config("config.cfg", server_mac) != 0) {
-        fprintf(stderr, RED "Error: Failed to read MAC address from config file.\n" RESET);
-        exit(1);
+    // Initialize client
+    init_client(&client);
+    setup_terminal();
+    
+    printf("=== TREASURE HUNT CLIENT ===\n");
+    printf("Interface: %s\n", argv[1]);
+    printf("Use WASD keys or arrow keys to move (W/Up=Up, A/Left=Left, S/Down=Down, D/Right=Right), Q to quit\n\n");
+    
+    display_grid(&client);
+
+    // Main client loop
+    char input;
+    while ((input = get_user_input()) != 'q' && input != 'Q') {
+        PacketType move_type;
+        int valid_move = 1;
+        
+        switch (input) {
+            case 'w': case 'W': move_type = PKT_MOVE_UP; break;
+            case 'a': case 'A': move_type = PKT_MOVE_LEFT; break;
+            case 's': case 'S': move_type = PKT_MOVE_DOWN; break;
+            case 'd': case 'D': move_type = PKT_MOVE_RIGHT; break;
+            default: 
+                valid_move = 0;
+                printf("Invalid input. Use WASD or arrow keys to move, Q to quit.\n");
+                break;
+        }
+        
+        if (valid_move) {
+            if (send_movement(&client, move_type) == 0) {
+                // Wait for server response using direct recvfrom with proper unpacking
+                PacketRaw raw_response;
+                struct sockaddr_ll server_addr;
+                socklen_t addr_len = sizeof(server_addr);
+                
+                ssize_t received = recvfrom(client.socket_fd, &raw_response, sizeof(PacketRaw), 0,
+                                          (struct sockaddr *)&server_addr, &addr_len);
+                
+                if (received == sizeof(PacketRaw)) {
+                    Packet response;
+                    unpack_packet(&raw_response, &response);
+                    
+                    if (validate_packet(&response)) {
+                        process_server_packet(&client, &response);
+                        display_grid(&client);
+                    }
+                }
+            }
+        }
     }
-    memcpy(addr.sll_addr, server_mac, ETH_ALEN);
 
-    ClientCommand cmd = parse_command(argv[2]);
-    if (cmd == CMD_INVALID) {
-        fprintf(stderr, "Invalid command\n");
-        exit(1);
+    restore_terminal();
+    close(client.socket_fd);
+    printf("Game ended. Treasures found: %d\n", client.treasures_found);
+    return 0;
+}
+
+void init_client(ClientState *client) {
+    // Initialize player position at bottom-left (0,0)
+    client->player_x = 0;
+    client->player_y = 0;
+    client->seq_num = 0;
+    client->treasures_found = 0;
+    
+    // Initialize grid
+    for (int y = 0; y < GRID_SIZE; y++) {
+        for (int x = 0; x < GRID_SIZE; x++) {
+            client->grid[y][x].x = x;
+            client->grid[y][x].y = y;
+            client->grid[y][x].visited = 0;
+            client->grid[y][x].has_treasure = 0;
+            memset(client->grid[y][x].treasure_name, 0, sizeof(client->grid[y][x].treasure_name));
+        }
     }
+    
+    // Mark starting position as visited
+    client->grid[0][0].visited = 1;
+}
 
-    ClientContext ctx;
-    init_client_context(&ctx, socket_fd, argv[3], cmd);
-    ctx.addr = addr;
+void display_grid(const ClientState *client) {
+    printf("\n=== TREASURE HUNT GRID ===\n");
+    printf("Player position: (%d, %d) | Treasures found: %d\n", 
+           client->player_x, client->player_y, client->treasures_found);
+    printf("Legend: P=Player, *=Treasure, o=Visited, .=Unvisited\n\n");
+    
+    printf("  ");
+    for (int x = 0; x < GRID_SIZE; x++) printf("%d ", x);
+    printf("\n");
+    
+    for (int y = GRID_SIZE - 1; y >= 0; y--) {
+        printf("%d ", y);
+        for (int x = 0; x < GRID_SIZE; x++) {
+            char cell = '.';
+            
+            // Check if player is here
+            if (client->player_x == x && client->player_y == y) {
+                cell = 'P';
+            } else if (client->grid[y][x].has_treasure) {
+                cell = '*';
+            } else if (client->grid[y][x].visited) {
+                cell = 'o';
+            }
+            
+            printf("%c ", cell);
+        }
+        printf("\n");
+    }
+    
+    if (client->treasures_found > 0) {
+        printf("\nTreasures discovered:\n");
+        for (int y = 0; y < GRID_SIZE; y++) {
+            for (int x = 0; x < GRID_SIZE; x++) {
+                if (client->grid[y][x].has_treasure) {
+                    printf("  %s at (%d,%d)\n", client->grid[y][x].treasure_name, x, y);
+                }
+            }
+        }
+    }
+    
+    printf("===========================\n");
+    printf("Move: W/↑(Up) A/←(Left) S/↓(Down) D/→(Right) or Arrow Keys, Q(Quit): ");
+    fflush(stdout);
+}
 
-    switch (ctx.cmd) {
-        case CMD_BACKUP:
-            backup_file(ctx.socket, ctx.filename, &ctx.addr);
+int send_movement(ClientState *client, PacketType move_type) {
+    // Store the intended movement for later confirmation
+    client->pending_move = move_type;
+    
+    Packet move_pkt = {
+        .start_marker = START_MARKER,
+        .size = 0,
+        .seq = client->seq_num++,
+        .type = move_type
+    };
+    move_pkt.checksum = calculate_crc(&move_pkt);
+    
+    // Pack the packet for transmission
+    PacketRaw raw_pkt;
+    pack_packet(&move_pkt, &raw_pkt);
+    
+    // Send the packed packet
+    ssize_t sent = sendto(client->socket_fd, &raw_pkt, sizeof(PacketRaw), 0,
+                         (struct sockaddr *)&client->server_addr, sizeof(client->server_addr));
+    
+    return (sent == sizeof(PacketRaw)) ? 0 : -1;
+}
+
+void process_server_packet(ClientState *client, const Packet *pkt) {
+    switch (pkt->type) {
+        case PKT_OK_ACK:
+            // Regular movement was successful, update client position
+            switch (client->pending_move) {
+                case PKT_MOVE_RIGHT: client->player_x++; break;
+                case PKT_MOVE_LEFT:  client->player_x--; break;
+                case PKT_MOVE_UP:    client->player_y++; break;
+                case PKT_MOVE_DOWN:  client->player_y--; break;
+                default: break;
+            }
+            // Mark new position as visited
+            client->grid[client->player_y][client->player_x].visited = 1;
+            printf("Move successful! New position: (%d,%d)\n", client->player_x, client->player_y);
             break;
-        case CMD_RESTORE:
-            if (restore_file(ctx.socket, ctx.filename, &ctx.addr) != 0) {
-                fprintf(stderr, "An error occurred during file restoration.\n");
-                exit(1);
+            
+        case PKT_ERROR:
+            if (pkt->size > 0) {
+                if (pkt->data[0] == ERR_NO_PERMISSION) {
+                    printf("Invalid move - out of bounds!\n");
+                } else if (pkt->data[0] == ERR_NO_SPACE) {
+                    printf("Error: Insufficient disk space!\n");
+                }
             }
             break;
-        case CMD_VERIFY:
-            verify_file(ctx.socket, ctx.filename, &ctx.addr);
+            
+        case PKT_SIZE:
+            // File transfer starting - this means move was successful AND treasure found
+            // Update position first
+            switch (client->pending_move) {
+                case PKT_MOVE_RIGHT: client->player_x++; break;
+                case PKT_MOVE_LEFT:  client->player_x--; break;
+                case PKT_MOVE_UP:    client->player_y++; break;
+                case PKT_MOVE_DOWN:  client->player_y--; break;
+                default: break;
+            }
+            // Mark new position as visited
+            client->grid[client->player_y][client->player_x].visited = 1;
+            
+            printf("Move successful! Treasure discovered at (%d,%d)! Receiving file...\n", 
+                   client->player_x, client->player_y);
+            receive_file_transfer(client);
             break;
+            
         default:
-            fprintf(stderr, "Invalid command\n");
-            exit(1);
+            printf("Received unknown packet type: %d\n", pkt->type);
+            break;
     }
+}
 
+int receive_file_transfer(ClientState *client) {
+    char filename[64] = {0};
+    char filepath[128] = {0};
+    PacketType file_type = PKT_TEXT_ACK;
+    uint32_t file_size = 0;
+    uint32_t bytes_received = 0;
+    FILE *file = NULL;
+    
+    // Receive packets until end of file using proper stop-and-wait protocol
+    Packet pkt;
+    while (1) {
+        ssize_t received = receive_packet(client->socket_fd, &pkt, &client->server_addr);
+        if (received <= 0) continue;
+        
+        switch (pkt.type) {
+            case PKT_SIZE:
+                // File size packet
+                if (pkt.size >= sizeof(uint32_t)) {
+                    memcpy(&file_size, pkt.data, sizeof(uint32_t));
+                    file_size = ntohl(file_size);
+                    printf("File size: %u bytes\n", file_size);
+                    
+                    // Check disk space
+                    if (!check_disk_space(RECEIVED_FILES_DIR, file_size)) {
+                        printf("Error: Insufficient disk space!\n");
+                        return -1;
+                    }
+                }
+                break;
+                
+            case PKT_TEXT_ACK:
+            case PKT_VIDEO_ACK:
+            case PKT_IMAGE_ACK:
+                // Filename packet
+                file_type = pkt.type;
+                strncpy(filename, (char*)pkt.data, pkt.size);
+                filename[pkt.size] = '\0';
+                snprintf(filepath, sizeof(filepath), "%s/%s", RECEIVED_FILES_DIR, filename);
+                
+                file = fopen(filepath, "wb");
+                if (!file) {
+                    printf("Error: Could not create file %s\n", filepath);
+                    return -1;
+                }
+                printf("Receiving: %s\n", filename);
+                break;
+                
+            case PKT_DATA:
+                // File data packet
+                if (file && pkt.size > 0) {
+                    fwrite(pkt.data, 1, pkt.size, file);
+                    bytes_received += pkt.size;
+                    printf("Received %u/%u bytes\r", bytes_received, file_size);
+                    fflush(stdout);
+                }
+                break;
+                
+            case PKT_END_FILE:
+                // End of file transfer
+                if (file) {
+                    fclose(file);
+                    file = NULL;
+                }
+                printf("\nFile transfer completed: %s\n", filename);
+                
+                // Mark treasure on grid
+                client->grid[client->player_y][client->player_x].has_treasure = 1;
+                strncpy(client->grid[client->player_y][client->player_x].treasure_name, 
+                       filename, sizeof(client->grid[client->player_y][client->player_x].treasure_name) - 1);
+                client->treasures_found++;
+                
+                // Handle the treasure file
+                handle_treasure_file(filepath, file_type);
+                return 0;
+                
+            default:
+                break;
+        }
+    }
+    
+    if (file) fclose(file);
+    return -1;
+}
+
+void handle_treasure_file(const char *filename, PacketType file_type) {
+    char command[256];
+    
+    switch (file_type) {
+        case PKT_TEXT_ACK:
+            printf("Opening text file...\n");
+            snprintf(command, sizeof(command), "less \"%s\"", filename);
+            system(command);
+            break;
+            
+        case PKT_IMAGE_ACK:
+            printf("Opening image file...\n");
+            snprintf(command, sizeof(command), "xdg-open \"%s\" 2>/dev/null || feh \"%s\" 2>/dev/null || echo 'Could not open image'", filename, filename);
+            system(command);
+            break;
+            
+        case PKT_VIDEO_ACK:
+            printf("Opening media file...\n");
+            // Check if it's an audio file
+            if (strstr(filename, ".mp3") || strstr(filename, ".wav") || strstr(filename, ".ogg")) {
+                snprintf(command, sizeof(command), "xdg-open \"%s\" 2>/dev/null || mpg123 \"%s\" 2>/dev/null || aplay \"%s\" 2>/dev/null || echo 'Could not open audio file'", filename, filename, filename);
+            } else {
+                snprintf(command, sizeof(command), "xdg-open \"%s\" 2>/dev/null || vlc \"%s\" 2>/dev/null || echo 'Could not open video'", filename, filename);
+            }
+            system(command);
+            break;
+            
+        default:
+            printf("Unknown file type, saved as: %s\n", filename);
+            break;
+    }
+}
+
+char get_user_input(void) {
+    char c;
+    if (read(STDIN_FILENO, &c, 1) == 1) {
+        // Handle escape sequences for arrow keys
+        if (c == '\033') { // ESC sequence
+            char seq[2];
+            if (read(STDIN_FILENO, &seq[0], 1) == 1 && 
+                read(STDIN_FILENO, &seq[1], 1) == 1) {
+                if (seq[0] == '[') {
+                    switch (seq[1]) {
+                        case 'A': return 'w'; // Up arrow -> W
+                        case 'B': return 's'; // Down arrow -> S  
+                        case 'C': return 'd'; // Right arrow -> D
+                        case 'D': return 'a'; // Left arrow -> A
+                    }
+                }
+            }
+            return 0; // Invalid escape sequence
+        }
+        return c;
+    }
     return 0;
+}
+
+void setup_terminal(void) {
+    struct termios new_termios;
+    
+    // Save current terminal settings
+    tcgetattr(STDIN_FILENO, &old_termios);
+    
+    // Set new terminal settings for immediate input
+    new_termios = old_termios;
+    new_termios.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
+}
+
+void restore_terminal(void) {
+    // Restore original terminal settings
+    tcsetattr(STDIN_FILENO, TCSANOW, &old_termios);
+}
+
+int check_disk_space(const char *path, size_t required_space) {
+    struct statvfs stats;
+    
+    if (statvfs(path, &stats) != 0) {
+        return 0; // Assume insufficient space on error
+    }
+    
+    size_t available_space = stats.f_bsize * stats.f_bavail;
+    return available_space >= required_space;
+}
+
+void create_received_dir(void) {
+    struct stat st = {0};
+    
+    if (stat(RECEIVED_FILES_DIR, &st) == -1) {
+        if (mkdir(RECEIVED_FILES_DIR, 0755) != 0) {
+            printf("Warning: Could not create %s directory\n", RECEIVED_FILES_DIR);
+        }
+    }
 }
