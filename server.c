@@ -355,9 +355,10 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     Packet size_pkt = {
         .start_marker = START_MARKER,
         .size = sizeof(uint32_t),
-        .seq = game->seq_num++,
+        .seq = game->seq_num & 0x1F,  // Ensure 5-bit wrapping
         .type = PKT_SIZE
     };
+    game->seq_num = (game->seq_num + 1) & 0x1F;  // Proper 5-bit increment
     uint32_t file_size = htonl(st.st_size);
     memcpy(size_pkt.data, &file_size, sizeof(uint32_t));
     size_pkt.checksum = calculate_crc(&size_pkt);
@@ -378,9 +379,10 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     Packet name_pkt = {
         .start_marker = START_MARKER,
         .size = strlen(filename),
-        .seq = game->seq_num++,
+        .seq = game->seq_num & 0x1F,  // Ensure 5-bit wrapping
         .type = file_type
     };
+    game->seq_num = (game->seq_num + 1) & 0x1F;  // Proper 5-bit increment
     strcpy((char*)name_pkt.data, filename);
     name_pkt.checksum = calculate_crc(&name_pkt);
     
@@ -398,9 +400,10 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
         Packet data_pkt = {
             .start_marker = START_MARKER,
             .size = bytes_read,
-            .seq = game->seq_num++,
+            .seq = game->seq_num & 0x1F,  // Ensure 5-bit wrapping
             .type = PKT_DATA
         };
+        game->seq_num = (game->seq_num + 1) & 0x1F;  // Proper 5-bit increment
         memcpy(data_pkt.data, buffer, bytes_read);
         data_pkt.checksum = calculate_crc(&data_pkt);
         
@@ -419,9 +422,10 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     Packet eof_pkt = {
         .start_marker = START_MARKER,
         .size = 0,
-        .seq = game->seq_num++,
+        .seq = game->seq_num & 0x1F,  // Ensure 5-bit wrapping
         .type = PKT_END_FILE
     };
+    game->seq_num = (game->seq_num + 1) & 0x1F;  // Proper 5-bit increment
     eof_pkt.checksum = calculate_crc(&eof_pkt);
     
     if (send_packet(game->socket_fd, &eof_pkt, &game->client_addr) < 0) {

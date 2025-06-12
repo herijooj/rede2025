@@ -136,8 +136,9 @@ int send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr) {
     ((Packet *)pkt)->checksum = calculate_crc(pkt);
     raw_pkt.checksum = pkt->checksum;
     
-    int timeout_ms = 1000;  // Start with 1 second timeout
-    const int max_retries = 5;
+    int timeout_ms = 500;   // Start with 500ms timeout (reduced from 1000ms)
+    const int max_retries = 10;  // Increased retries for large files
+    const int max_timeout = 2000; // Cap timeout at 2 seconds
     int retries = 0;
     
     while (retries < max_retries) {
@@ -170,7 +171,17 @@ int send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr) {
         
         // If we get here, either send failed or no valid ACK received
         retries++;
-        timeout_ms *= 2;  // Exponential backoff
+        // More conservative exponential backoff with cap
+        timeout_ms = (timeout_ms * 3) / 2;  // 1.5x multiplier instead of 2x
+        if (timeout_ms > max_timeout) {
+            timeout_ms = max_timeout;  // Cap at 2 seconds
+        }
+        
+        // Add small progress indicator for debugging
+        if (retries > 3) {
+            printf(".");
+            fflush(stdout);
+        }
     }
     
     return -1;  // All retries failed
@@ -182,7 +193,7 @@ ssize_t receive_packet(int socket_fd, Packet *pkt, struct sockaddr_ll *addr) {
     
     socklen_t addr_len = sizeof(struct sockaddr_ll);
     long long start_time = get_timestamp_ms();
-    const int timeout_ms = 300;  // 300ms timeout
+    const int timeout_ms = 1000;  // Increased from 300ms to 1000ms for large files
     
     while (get_timestamp_ms() - start_time < timeout_ms) {
         PacketRaw raw_pkt;

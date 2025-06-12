@@ -197,9 +197,10 @@ int send_movement(ClientState *client, PacketType move_type) {
     Packet move_pkt = {
         .start_marker = START_MARKER,
         .size = 0,
-        .seq = client->seq_num++,
+        .seq = client->seq_num & 0x1F,  // Ensure 5-bit wrapping
         .type = move_type
     };
+    client->seq_num = (client->seq_num + 1) & 0x1F;  // Proper 5-bit increment
     move_pkt.checksum = calculate_crc(&move_pkt);
     
     // Pack the packet for transmission
