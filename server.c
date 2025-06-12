@@ -1,293 +1,426 @@
-#define SERVER_MODE
 #include "sockets.h"
-#include "debug.h"
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <linux/limits.h> // Added for PATH_MAX
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
 
-#define BACKUP_DIR "./backup/"
-#define IDLE_TIMEOUT_SEC 10
-#define ACTIVITY_TIMEOUT_SEC 5
-
-typedef enum {
-    STATE_IDLE = 0,
-    STATE_RECEIVING = 1,
-    STATE_ERROR = 2
-} ServerState;
+#define GRID_SIZE 8
+#define MAX_TREASURES 8
+#define OBJECTS_DIR "./objetos"
 
 typedef struct {
-    ServerState state;
-    int current_fd;
-    char backup_path[PATH_MAX];
-} ServerContext;
+    int x, y;
+    char filename[64];
+    int discovered;
+} Treasure;
 
 typedef struct {
-    int fd;
-    char filename[PATH_MAX];
-    uint64_t file_size;
-    uint64_t bytes_sent;
-    uint8_t sequence;
-    time_t last_activity;
-} RestoreContext;
+    int player_x, player_y;
+    Treasure treasures[MAX_TREASURES];
+    int treasure_count;
+    int socket_fd;
+    struct sockaddr_ll client_addr;
+    uint8_t seq_num;
+} GameState;
 
-static int current_state = STATE_IDLE;
-static int current_fd = -1;
-
-void handle_data_packet(int socket, Packet *packet, int fd, struct sockaddr_ll *addr, struct TransferStats *stats);
-void handle_backup(int socket, Packet *packet, struct sockaddr_ll *addr, struct TransferStats *stats);
-
-void display_help(const char* program_name) {
-    printf(BLUE "NARBS Server (Not A Real Backup Solution)\\n" RESET);
-    printf(GREEN "Usage:\\n" RESET);
-    printf("  %s <interface>\\n\\n", program_name);
-    printf(YELLOW "Description:\\n" RESET);
-    printf("  Server component that handles file backup requests\\n"); // Simplified description
-    printf(BLUE "Storage:\\n" RESET);
-    printf("  Files are stored in: %s\\n\\n", BACKUP_DIR);
-    printf(YELLOW "Options:\\n" RESET);
-    printf("  -h        - Display this help message");
-}
-
-void handle_data_packet(int socket, Packet *packet, int fd, struct sockaddr_ll *addr, struct TransferStats *stats) {
-    size_t data_len = GET_SIZE(packet->size_seq_type);
-
-    if (data_len > MAX_DATA_SIZE) {
-        DBG_ERROR("Invalid packet length: %zu (max %d)\n", data_len, MAX_DATA_SIZE);
-        send_error(socket, addr, ERR_SEQUENCE, true);
-        return;
-    }
-
-    if (GET_SEQUENCE(packet->size_seq_type) > SEQ_NUM_MAX) {
-        DBG_ERROR("Invalid sequence number: %d (max %d)\n", GET_SEQUENCE(packet->size_seq_type), SEQ_NUM_MAX);
-        send_error(socket, addr, ERR_SEQUENCE, true);
-        return;
-    }
-
-    DBG_INFO("DATA packet: seq=%d/%d, len=%zu, total=%zu/%zu\n", GET_SEQUENCE(packet->size_seq_type), stats->expected_seq, data_len, stats->total_received, stats->total_expected);
-
-    // Sequence Number Handling
-    uint8_t recv_seq = GET_SEQUENCE(packet->size_seq_type);
-    uint8_t exp_seq = stats->expected_seq;
-
-    // Add detailed validation debugging
-    uint8_t computed_crc = calculate_crc(packet);
-    debug_packet_validation(packet, computed_crc);
-
-    // Sequence validation with wrap-around handling
-    if (recv_seq != exp_seq) {
-        if ((recv_seq == 0 && exp_seq == SEQ_NUM_MAX) || 
-            SEQ_DIFF(recv_seq, exp_seq) <= SEQ_NUM_MAX/2) {
-            // Valid sequence progression
-            transfer_update_stats(stats, data_len, recv_seq);
-        } else {
-            debug_sequence_error(stats, recv_seq);
-            stats->had_errors = 1;
-            send_error(socket, addr, ERR_SEQUENCE, true);
-            return;
-        }
-    } else {
-        transfer_update_stats(stats, data_len, recv_seq);
-    }
-
-    ssize_t written = write(fd, packet->data, data_len);
-    if (written != data_len) {
-        DBG_ERROR("Write failed: %s\n", strerror(errno));
-        stats->had_errors = 1;
-        send_error(socket, addr, ERR_NO_SPACE, true);
-        return;
-    }
-
-    // Update stats with actual written bytes
-    stats->total_received += written;
-    transfer_update_stats(stats, 0, recv_seq);  // Don't add bytes here
-
-    // Send ACK with Correct Sequence Number
-    Packet ack = {0};
-    ack.start_marker = START_MARKER;
-    SET_TYPE(ack.size_seq_type, PKT_OK);
-    SET_SEQUENCE(ack.size_seq_type, recv_seq);
-    SET_SIZE(ack.size_seq_type, 0);
-    ack.crc = calculate_crc(&ack);
-    send_packet(socket, &ack, addr, true);
-
-    // Add progress debugging
-    debug_transfer_progress(stats, packet);
-}
-
-void handle_backup(int socket, Packet *packet, struct sockaddr_ll *addr, struct TransferStats *stats) {
-    char *filename = packet->data;
-    char *base_filename = strrchr(filename, '/');
-    if (base_filename) {
-        base_filename++;
-    } else {
-        base_filename = filename;
-    }
-    
-    size_t file_size = *((size_t *)(packet->data + strlen(packet->data) + 1));
-    memset(stats, 0, sizeof(struct TransferStats));
-    stats->total_expected = file_size;
-
-    DBG_INFO("Starting backup: file=%s, expected_size=%zu\n", filename, file_size);
-
-    char filepath[PATH_MAX];
-    snprintf(filepath, sizeof(filepath), "%s%s", BACKUP_DIR, base_filename);
-
-    int fd = open(filepath, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-    if (fd < 0) {
-        DBG_ERROR("Cannot open file for writing: %s\n", strerror(errno));
-        send_error(socket, addr, ERR_NO_ACCESS, true);
-        return;
-    }
-    current_fd = fd;
-
-    if (set_socket_timeout(socket, SOCKET_TIMEOUT_MS) < 0) {
-        DBG_ERROR("Failed to set transfer timeout\n");
-        send_error(socket, addr, ERR_TIMEOUT, true);
-        close(current_fd);
-        current_fd = -1;
-        return;
-    }
-
-    send_ack(socket, addr, PKT_ACK, true);
-    send_ack(socket, addr, PKT_OK_SIZE, true);
-
-    // Add initial transfer debugging
-    debug_transfer_progress(stats, packet);
-}
-
-static void reset_server_state() {
-    if (current_fd >= 0) {
-        close(current_fd);
-        current_fd = -1;
-    }
-    current_state = STATE_IDLE;
-    DBG_INFO("Server state reset, ready for new transactions\\n");
-}
-
-static bool check_timeout(time_t last_activity) {
-    time_t now = time(NULL);
-    time_t timeout = (current_state == STATE_IDLE) ? IDLE_TIMEOUT_SEC : ACTIVITY_TIMEOUT_SEC;
-    
-    if (now - last_activity > timeout) {
-        DBG_WARN("Client timeout detected after %ld seconds\n", now - last_activity);
-        reset_server_state();
-        return true;
-    }
-    return false;
-}
+// Function prototypes
+void init_game(GameState *game);
+void display_server_state(const GameState *game);
+int find_treasure_files(GameState *game);
+int handle_movement(GameState *game, PacketType move_type);
+int send_file_to_client(GameState *game, const char *filepath, PacketType file_type);
+void process_client_packet(GameState *game, const Packet *pkt);
+void log_movement(const GameState *game, const char *direction);
+int check_treasure_discovery(GameState *game);
+int count_undiscovered(const GameState *game);
 
 int main(int argc, char *argv[]) {
-    debug_init();
-    debug_init_error_log("server");
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <interface>\n", argv[0]);
+        return 1;
+    }
 
-    if (argc == 2 && strcmp(argv[1], "-h") == 0) {
-        display_help(argv[0]);
+    GameState game = {0};
+    
+    // Create raw socket
+    game.socket_fd = create_raw_socket(argv[1]);
+    if (game.socket_fd < 0) {
+        fprintf(stderr, "Failed to create raw socket\n");
+        return 1;
+    }
+
+    // Get interface info
+    if (get_interface_info(game.socket_fd, argv[1], &game.client_addr) < 0) {
+        close(game.socket_fd);
+        return 1;
+    }
+
+    // Initialize game
+    init_game(&game);
+    
+    printf("=== TREASURE HUNT SERVER ===\n");
+    printf("Interface: %s\n", argv[1]);
+    printf("Waiting for client connections...\n\n");
+    
+    display_server_state(&game);
+
+    // Main server loop
+    Packet pkt;
+    struct sockaddr_ll client_addr;
+    socklen_t addr_len = sizeof(client_addr);
+    
+    while (1) {
+        // Use direct recvfrom with proper packet unpacking
+        PacketRaw raw_pkt;
+        ssize_t received = recvfrom(game.socket_fd, &raw_pkt, sizeof(PacketRaw), 0,
+                                  (struct sockaddr *)&client_addr, &addr_len);
+        
+        if (received == sizeof(PacketRaw)) {
+            // Unpack the received packet
+            unpack_packet(&raw_pkt, &pkt);
+            
+            if (validate_packet(&pkt)) {
+                // Update client address for responses
+                game.client_addr = client_addr;
+                process_client_packet(&game, &pkt);
+                display_server_state(&game);
+            }
+        }
+    }
+
+    close(game.socket_fd);
+    return 0;
+}
+
+void init_game(GameState *game) {
+    // Initialize player position at bottom-left (0,0)
+    game->player_x = 0;
+    game->player_y = 0;
+    game->seq_num = 0;
+    
+    // Find treasure files
+    game->treasure_count = find_treasure_files(game);
+    
+    // Randomly place treasures on the grid
+    srand(time(NULL));
+    for (int i = 0; i < game->treasure_count; i++) {
+        int placed = 0;
+        while (!placed) {
+            int x = rand() % GRID_SIZE;
+            int y = rand() % GRID_SIZE;
+            
+            // Check if position is already occupied
+            int occupied = 0;
+            for (int j = 0; j < i; j++) {
+                if (game->treasures[j].x == x && game->treasures[j].y == y) {
+                    occupied = 1;
+                    break;
+                }
+            }
+            
+            if (!occupied) {
+                game->treasures[i].x = x;
+                game->treasures[i].y = y;
+                game->treasures[i].discovered = 0;
+                placed = 1;
+            }
+        }
+    }
+}
+
+int find_treasure_files(GameState *game) {
+    DIR *dir = opendir(OBJECTS_DIR);
+    if (!dir) {
+        printf("Warning: Could not open %s directory\n", OBJECTS_DIR);
         return 0;
     }
 
-    if (argc != 2) {
-        fprintf(stderr, RED "Error: Invalid number of arguments\\n" RESET);
-        fprintf(stderr, "Use '%s <interface>' or '%s -h' for help\\n", argv[0], argv[0]); // Simplified usage
-        exit(1);
-    }
-
-    umask(0);
-
-    int socket_fd = cria_raw_socket(argv[1]);
-    if (socket_fd < 0) {
-        fprintf(stderr, RED "Error: Could not create socket on interface %s\\n" RESET, argv[1]);
-        exit(1);
-    }
-
-    Packet packet = {0};
-    memset(packet.padding, 0, PAD_SIZE);
-    mkdir(BACKUP_DIR, 0777);
-    struct sockaddr_ll client_addr;
-    struct TransferStats stats;
-    time_t last_activity = time(NULL);
-
-    while (1) {
-        if (check_timeout(last_activity)) {
-            last_activity = time(NULL);
-            continue;
+    struct dirent *entry;
+    int count = 0;
+    
+    while ((entry = readdir(dir)) != NULL && count < MAX_TREASURES) {
+        // Check if filename matches pattern: digit 1-8 followed by a dot (1.xxx to 8.xxx)
+        if (entry->d_name[0] >= '1' && entry->d_name[0] <= '8' && 
+            entry->d_name[1] == '.' && strlen(entry->d_name) > 2) {
+            snprintf(game->treasures[count].filename, sizeof(game->treasures[count].filename),
+                    "%s/%s", OBJECTS_DIR, entry->d_name);
+            count++;
         }
+    }
+    
+    closedir(dir);
+    return count;
+}
 
-        set_socket_timeout(socket_fd, ACTIVITY_TIMEOUT_SEC * 1000);
-
-        ssize_t recv_result = receive_packet(socket_fd, &packet, &client_addr, false);
-        if (recv_result > 0) {
-            last_activity = time(NULL);
+void display_server_state(const GameState *game) {
+    printf("\n=== SERVER STATE ===\n");
+    printf("Player position: (%d, %d)\n", game->player_x, game->player_y);
+    printf("Treasures found: %d/%d\n", 
+           game->treasure_count - count_undiscovered(game), game->treasure_count);
+    
+    printf("\nGrid (P=Player, T=Treasure, D=Discovered, .=Empty):\n");
+    printf("  ");
+    for (int x = 0; x < GRID_SIZE; x++) printf("%d ", x);
+    printf("\n");
+    
+    for (int y = GRID_SIZE - 1; y >= 0; y--) {
+        printf("%d ", y);
+        for (int x = 0; x < GRID_SIZE; x++) {
+            char cell = '.';
             
-            switch (GET_TYPE(packet.size_seq_type)) {
-                case PKT_BACKUP:
-                    if (current_state != STATE_IDLE) {
-                        DBG_WARN("Received backup request while busy, resetting state\\n");
-                        reset_server_state();
+            // Check if player is here
+            if (game->player_x == x && game->player_y == y) {
+                cell = 'P';
+            } else {
+                // Check for treasures
+                for (int i = 0; i < game->treasure_count; i++) {
+                    if (game->treasures[i].x == x && game->treasures[i].y == y) {
+                        cell = game->treasures[i].discovered ? 'D' : 'T';
+                        break;
                     }
-                    current_state = STATE_RECEIVING;
-                    size_t expected_file_size = *((size_t *)(packet.data + strlen(packet.data) + 1));
-                    transfer_init_stats(&stats, expected_file_size);
-                    handle_backup(socket_fd, &packet, &client_addr, &stats);
-                    break;
-
-                case PKT_DATA:
-                    if (current_state != STATE_RECEIVING || current_fd < 0) {
-                        DBG_WARN("Received data packet in invalid state, ignoring\\n");
-                        send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
-                        continue;
-                    }
-                    handle_data_packet(socket_fd, &packet, current_fd, &client_addr, &stats);
-                    break;
-
-                case PKT_END_TX:
-                    if (current_state != STATE_RECEIVING || current_fd < 0) {
-                        DBG_WARN("Received END_TX in invalid state, ignoring\\n");
-                        continue;
-                    }
-                    DBG_INFO("Received END_TX\\n");
-                    print_transfer_summary(&stats);
-
-                    if (stats.total_received == stats.total_expected) {
-                        Packet end_tx_ack = {0};
-                        end_tx_ack.start_marker = START_MARKER;
-                        SET_TYPE(end_tx_ack.size_seq_type, PKT_OK_CHSUM);
-                        SET_SEQUENCE(end_tx_ack.size_seq_type, 0);
-                        SET_SIZE(end_tx_ack.size_seq_type, 0);
-                        end_tx_ack.crc = calculate_crc(&end_tx_ack); // is_send = true
-                        send_packet(socket_fd, &end_tx_ack, &client_addr, true);
-                        DBG_INFO("Transfer completed successfully\\n");
-                    } else {
-                        DBG_ERROR("Incomplete transfer: %zu/%zu bytes\\n", stats.total_received, stats.total_expected);
-                        send_error(socket_fd, &client_addr, ERR_SEQUENCE, true);
-                    }
-                    reset_server_state();
-                    break;
-
-                case PKT_ERROR:
-                    DBG_ERROR("Received error from client: code %d\\n", packet.data[0]);
-
-                    if (current_fd >= 0) {
-                        close(current_fd);
-                        current_fd = -1;
-                    }
-                    current_state = STATE_IDLE;
-                    break;
-
-                default:
-                    if (current_state != STATE_IDLE) {
-                        DBG_WARN("Timeout in non-idle state, resetting\\n");
-                        reset_server_state();
-                    }
-                    break;
+                }
             }
-        } else if (recv_result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            DBG_ERROR("Receive error: %s\\n", strerror(errno));
-            if (current_state != STATE_IDLE) {
-                reset_server_state();
+            printf("%c ", cell);
+        }
+        printf("\n");
+    }
+    
+    printf("\nTreasure locations:\n");
+    for (int i = 0; i < game->treasure_count; i++) {
+        printf("  %s at (%d,%d) - %s\n",
+               game->treasures[i].filename,
+               game->treasures[i].x, game->treasures[i].y,
+               game->treasures[i].discovered ? "DISCOVERED" : "hidden");
+    }
+    printf("========================\n\n");
+}
+
+int count_undiscovered(const GameState *game) {
+    int count = 0;
+    for (int i = 0; i < game->treasure_count; i++) {
+        if (!game->treasures[i].discovered) count++;
+    }
+    return count;
+}
+
+void process_client_packet(GameState *game, const Packet *pkt) {
+    switch (pkt->type) {
+        case PKT_MOVE_RIGHT:
+            if (handle_movement(game, PKT_MOVE_RIGHT)) {
+                log_movement(game, "RIGHT");
+                // Check for treasure first, then send appropriate response
+                int treasure_found = check_treasure_discovery(game);
+                if (!treasure_found) {
+                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                }
+            } else {
+                send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
             }
+            break;
+            
+        case PKT_MOVE_LEFT:
+            if (handle_movement(game, PKT_MOVE_LEFT)) {
+                log_movement(game, "LEFT");
+                int treasure_found = check_treasure_discovery(game);
+                if (!treasure_found) {
+                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                }
+            } else {
+                send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
+            }
+            break;
+            
+        case PKT_MOVE_UP:
+            if (handle_movement(game, PKT_MOVE_UP)) {
+                log_movement(game, "UP");
+                int treasure_found = check_treasure_discovery(game);
+                if (!treasure_found) {
+                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                }
+            } else {
+                send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
+            }
+            break;
+            
+        case PKT_MOVE_DOWN:
+            if (handle_movement(game, PKT_MOVE_DOWN)) {
+                log_movement(game, "DOWN");
+                int treasure_found = check_treasure_discovery(game);
+                if (!treasure_found) {
+                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                }
+            } else {
+                send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
+            }
+            break;
+            
+        default:
+            printf("Received unknown packet type: %d\n", pkt->type);
+            send_ack(game->socket_fd, &game->client_addr, PKT_NACK);
+            break;
+    }
+}
+
+int handle_movement(GameState *game, PacketType move_type) {
+    int new_x = game->player_x;
+    int new_y = game->player_y;
+    
+    switch (move_type) {
+        case PKT_MOVE_RIGHT: new_x++; break;
+        case PKT_MOVE_LEFT:  new_x--; break;
+        case PKT_MOVE_UP:    new_y++; break;
+        case PKT_MOVE_DOWN:  new_y--; break;
+        default: return 0;
+    }
+    
+    // Check bounds
+    if (new_x < 0 || new_x >= GRID_SIZE || new_y < 0 || new_y >= GRID_SIZE) {
+        return 0; // Invalid move
+    }
+    
+    // Update position
+    game->player_x = new_x;
+    game->player_y = new_y;
+    return 1; // Valid move
+}
+
+int check_treasure_discovery(GameState *game) {
+    for (int i = 0; i < game->treasure_count; i++) {
+        if (game->treasures[i].x == game->player_x && 
+            game->treasures[i].y == game->player_y && 
+            !game->treasures[i].discovered) {
+            
+            game->treasures[i].discovered = 1;
+            printf("TREASURE DISCOVERED at (%d,%d): %s\n", 
+                   game->player_x, game->player_y, game->treasures[i].filename);
+            
+            // Determine file type and send
+            PacketType file_type = PKT_TEXT_ACK;
+            if (strstr(game->treasures[i].filename, ".jpg") || 
+                strstr(game->treasures[i].filename, ".jpeg")) {
+                file_type = PKT_IMAGE_ACK;
+            } else if (strstr(game->treasures[i].filename, ".mp4")) {
+                file_type = PKT_VIDEO_ACK;
+            } else if (strstr(game->treasures[i].filename, ".mp3") ||
+                      strstr(game->treasures[i].filename, ".wav") ||
+                      strstr(game->treasures[i].filename, ".ogg")) {
+                file_type = PKT_VIDEO_ACK; // Use VIDEO_ACK for audio files too
+            }
+            
+            send_file_to_client(game, game->treasures[i].filename, file_type);
+            return 1; // Treasure found
         }
     }
+    return 0; // No treasure found
+}
 
+int send_file_to_client(GameState *game, const char *filepath, PacketType file_type) {
+    FILE *file = fopen(filepath, "rb");
+    if (!file) {
+        printf("Error: Could not open file %s\n", filepath);
+        send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
+        return -1;
+    }
+    
+    // Get file size
+    struct stat st;
+    if (stat(filepath, &st) < 0) {
+        fclose(file);
+        send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
+        return -1;
+    }
+    
+    printf("Sending file: %s (%ld bytes)\n", filepath, st.st_size);
+    
+    // Send file size using proper stop-and-wait
+    Packet size_pkt = {
+        .start_marker = START_MARKER,
+        .size = sizeof(uint32_t),
+        .seq = game->seq_num++,
+        .type = PKT_SIZE
+    };
+    uint32_t file_size = htonl(st.st_size);
+    memcpy(size_pkt.data, &file_size, sizeof(uint32_t));
+    size_pkt.checksum = calculate_crc(&size_pkt);
+    
+    if (send_packet(game->socket_fd, &size_pkt, &game->client_addr) < 0) {
+        fclose(file);
+        return -1;
+    }
+    
+    // Send filename with file type using proper stop-and-wait
+    const char *filename = strrchr(filepath, '/');
+    filename = filename ? filename + 1 : filepath;
+    
+    Packet name_pkt = {
+        .start_marker = START_MARKER,
+        .size = strlen(filename),
+        .seq = game->seq_num++,
+        .type = file_type
+    };
+    strcpy((char*)name_pkt.data, filename);
+    name_pkt.checksum = calculate_crc(&name_pkt);
+    
+    if (send_packet(game->socket_fd, &name_pkt, &game->client_addr) < 0) {
+        fclose(file);
+        return -1;
+    }
+    
+    // Send file data in chunks using proper stop-and-wait
+    uint8_t buffer[MAX_DATA_SIZE];
+    size_t bytes_read;
+    size_t total_sent = 0;
+    
+    while ((bytes_read = fread(buffer, 1, MAX_DATA_SIZE, file)) > 0) {
+        Packet data_pkt = {
+            .start_marker = START_MARKER,
+            .size = bytes_read,
+            .seq = game->seq_num++,
+            .type = PKT_DATA
+        };
+        memcpy(data_pkt.data, buffer, bytes_read);
+        data_pkt.checksum = calculate_crc(&data_pkt);
+        
+        if (send_packet(game->socket_fd, &data_pkt, &game->client_addr) < 0) {
+            printf("Failed to send data packet at offset %zu\n", total_sent);
+            fclose(file);
+            return -1;
+        }
+        
+        total_sent += bytes_read;
+        printf("Sent %zu/%ld bytes (seq: %d)\r", total_sent, st.st_size, data_pkt.seq);
+        fflush(stdout);
+    }
+    
+    // Send end of file using proper stop-and-wait
+    Packet eof_pkt = {
+        .start_marker = START_MARKER,
+        .size = 0,
+        .seq = game->seq_num++,
+        .type = PKT_END_FILE
+    };
+    eof_pkt.checksum = calculate_crc(&eof_pkt);
+    
+    if (send_packet(game->socket_fd, &eof_pkt, &game->client_addr) < 0) {
+        printf("Failed to send end-of-file packet\n");
+        fclose(file);
+        return -1;
+    }
+    
+    fclose(file);
+    printf("\nFile transfer completed: %s\n", filepath);
     return 0;
+}
+
+void log_movement(const GameState *game, const char *direction) {
+    time_t now;
+    time(&now);
+    char *time_str = ctime(&now);
+    time_str[strlen(time_str) - 1] = '\0'; // Remove newline
+    
+    printf("[%s] Player moved %s to (%d,%d)\n", 
+           time_str, direction, game->player_x, game->player_y);
 }
