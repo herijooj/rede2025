@@ -14,7 +14,6 @@
 // Function to get interface information
 int get_interface_info(int socket, char *interface, struct sockaddr_ll *addr) {
     struct ifreq if_idx;
-    struct ifreq if_mac;
 
     memset(&if_idx, 0, sizeof(if_idx));
     strncpy(if_idx.ifr_name, interface, IFNAMSIZ - 1);
@@ -24,20 +23,12 @@ int get_interface_info(int socket, char *interface, struct sockaddr_ll *addr) {
     }
     int ifindex = if_idx.ifr_ifindex;
 
-    memset(&if_mac, 0, sizeof(if_mac));
-    strncpy(if_mac.ifr_name, interface, IFNAMSIZ - 1);
-    if (ioctl(socket, SIOCGIFHWADDR, &if_mac) < 0) {
-        perror("SIOCGIFHWADDR");
-        return -1;
-    }
-
-    // Initialize socket address
+    // Initialize socket address (no MAC address needed)
     memset(addr, 0, sizeof(struct sockaddr_ll));
     addr->sll_family = AF_PACKET;
     addr->sll_protocol = htons(ETH_P_ALL);
     addr->sll_ifindex = ifindex;
-    addr->sll_halen = ETH_ALEN;
-    memcpy(addr->sll_addr, if_mac.ifr_hwaddr.sa_data, ETH_ALEN);
+    // addr->sll_halen and addr->sll_addr are not needed for bind
 
     return 0;
 }

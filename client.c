@@ -28,13 +28,6 @@ typedef struct {
 
 // Function declarations
 void display_help(const char* program_name);
-int read_mac_from_config(const char* filename, unsigned char* mac);
-
-
-static ClientCommand parse_command(const char *cmd_str) {
-    if (strcmp(cmd_str, "backup") == 0) return CMD_BACKUP;
-    return CMD_INVALID;
-}
 
 // Initialize client context
 static void init_client_context(ClientContext *ctx, int socket, char *filename, ClientCommand cmd) {
@@ -56,39 +49,6 @@ void display_help(const char* program_name) {
     printf("  -h        - Display this help message");
 }
 
-int parse_mac_address(const char *mac_str, unsigned char *mac_addr) {
-    int values[6];
-    if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x",
-               &values[0], &values[1], &values[2],
-               &values[3], &values[4], &values[5]) != 6) {
-        return -1;
-    }
-    for (int i = 0; i < 6; i++) {
-        if (values[i] < 0 || values[i] > 255) {
-            return -1;
-        }
-        mac_addr[i] = (unsigned char)values[i];
-    }
-    return 0;
-}
-
-int read_mac_from_config(const char *config_file, unsigned char *mac_addr) {
-    FILE *file = fopen(config_file, "r");
-    if (!file) {
-        DBG_ERROR("Cannot open config file %s: %s\n", config_file, strerror(errno));
-        return -1;
-    }
-    char line[256];
-    char mac_str[18] = {0};
-    while (fgets(line, sizeof(line), file)) {
-        if (sscanf(line, "server_mac=%17s", mac_str) == 1) {
-            fclose(file);
-            return parse_mac_address(mac_str, mac_addr);
-        }
-    }
-    fclose(file);
-    return -1;
-}
 void backup_file(int socket, char *filename, struct sockaddr_ll *addr) {
     DBG_INFO("Starting backup of %s\n", filename);
 
@@ -320,8 +280,8 @@ int main(int argc, char *argv[]) {
     }
 
     if (argc != 3) { // Changed from 4 to 3
-        fprintf(stderr, RED "Error: Invalid number of arguments\\n" RESET);
-        fprintf(stderr, "Use '%s <interface> <filename>' or '%s -h' for help\\n", argv[0], argv[0]); // Simplified usage
+        fprintf(stderr, RED "Error: Invalid number of arguments\n" RESET);
+        fprintf(stderr, "Use '%s <interface> <filename>' or '%s -h' for help\n", argv[0], argv[0]); // Simplified usage
         exit(1);
     }
 
@@ -330,13 +290,6 @@ int main(int argc, char *argv[]) {
     if (get_interface_info(socket_fd, argv[1], &addr) < 0) {
         exit(1);
     }
-
-    unsigned char server_mac[ETH_ALEN];
-    if (read_mac_from_config("config.cfg", server_mac) != 0) {
-        fprintf(stderr, RED "Error: Failed to read MAC address from config file.\\n" RESET);
-        exit(1);
-    }
-    memcpy(addr.sll_addr, server_mac, ETH_ALEN);
 
     // Command is implicitly CMD_BACKUP
     ClientContext ctx;

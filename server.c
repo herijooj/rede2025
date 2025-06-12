@@ -31,8 +31,6 @@ typedef struct {
     time_t last_activity;
 } RestoreContext;
 
-static RestoreContext restore_ctx = {0};
-
 static int current_state = STATE_IDLE;
 static int current_fd = -1;
 
