@@ -33,7 +33,7 @@ void init_client(ClientState *client);
 void display_grid(const ClientState *client);
 int send_movement(ClientState *client, PacketType move_type);
 void process_server_packet(ClientState *client, const Packet *pkt);
-int receive_file_transfer(ClientState *client);
+int receive_file_transfer(ClientState *client, const Packet *initial_pkt);
 void handle_treasure_file(const char *filename, PacketType file_type);
 char get_user_input(void);
 void setup_terminal(void);
@@ -216,13 +216,10 @@ int send_movement(ClientState *client, PacketType move_type) {
 void process_server_packet(ClientState *client, const Packet *pkt) {
     switch (pkt->type) {
         case PKT_OK_ACK:
-            // Regular movement was successful, update client position
-            switch (client->pending_move) {
-                case PKT_MOVE_RIGHT: client->player_x++; break;
-                case PKT_MOVE_LEFT:  client->player_x--; break;
-                case PKT_MOVE_UP:    client->player_y++; break;
-                case PKT_MOVE_DOWN:  client->player_y--; break;
-                default: break;
+            // Regular movement was successful, update client position from server data
+            if (pkt->size == 2) {
+                client->player_x = pkt->data[0];
+                client->player_y = pkt->data[1];
             }
             // Mark new position as visited
             client->grid[client->player_y][client->player_x].visited = 1;
@@ -241,20 +238,18 @@ void process_server_packet(ClientState *client, const Packet *pkt) {
             
         case PKT_SIZE:
             // File transfer starting - this means move was successful AND treasure found
-            // Update position first
-            switch (client->pending_move) {
-                case PKT_MOVE_RIGHT: client->player_x++; break;
-                case PKT_MOVE_LEFT:  client->player_x--; break;
-                case PKT_MOVE_UP:    client->player_y++; break;
-                case PKT_MOVE_DOWN:  client->player_y--; break;
-                default: break;
+            // The PKT_SIZE packet now contains the new position.
+            if (pkt->size >= sizeof(uint32_t) + 2) {
+                client->player_x = pkt->data[sizeof(uint32_t)];
+                client->player_y = pkt->data[sizeof(uint32_t) + 1];
             }
+
             // Mark new position as visited
             client->grid[client->player_y][client->player_x].visited = 1;
             
             printf("Move successful! Treasure discovered at (%d,%d)! Receiving file...\n", 
                    client->player_x, client->player_y);
-            receive_file_transfer(client);
+            receive_file_transfer(client, pkt);
             break;
             
         default:
@@ -263,7 +258,7 @@ void process_server_packet(ClientState *client, const Packet *pkt) {
     }
 }
 
-int receive_file_transfer(ClientState *client) {
+int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
     char filename[64] = {0};
     char filepath[128] = {0};
     PacketType file_type = PKT_TEXT_ACK;
@@ -271,28 +266,29 @@ int receive_file_transfer(ClientState *client) {
     uint32_t bytes_received = 0;
     FILE *file = NULL;
     
-    // Receive packets until end of file using proper stop-and-wait protocol
+    // The first packet (PKT_SIZE) is passed in, process it first.
+    if (initial_pkt->type == PKT_SIZE && initial_pkt->size >= sizeof(uint32_t)) {
+        memcpy(&file_size, initial_pkt->data, sizeof(uint32_t));
+        file_size = ntohl(file_size);
+        printf("File size: %u bytes\n", file_size);
+        
+        // Check disk space
+        if (!check_disk_space(RECEIVED_FILES_DIR, file_size)) {
+            printf("Error: Insufficient disk space!\n");
+            return -1;
+        }
+    } else {
+        fprintf(stderr, "Error: receive_file_transfer started with invalid packet.\n");
+        return -1;
+    }
+
+    // Receive subsequent packets until end of file using proper stop-and-wait protocol
     Packet pkt;
     while (1) {
         ssize_t received = receive_packet(client->socket_fd, &pkt, &client->server_addr);
         if (received <= 0) continue;
         
         switch (pkt.type) {
-            case PKT_SIZE:
-                // File size packet
-                if (pkt.size >= sizeof(uint32_t)) {
-                    memcpy(&file_size, pkt.data, sizeof(uint32_t));
-                    file_size = ntohl(file_size);
-                    printf("File size: %u bytes\n", file_size);
-                    
-                    // Check disk space
-                    if (!check_disk_space(RECEIVED_FILES_DIR, file_size)) {
-                        printf("Error: Insufficient disk space!\n");
-                        return -1;
-                    }
-                }
-                break;
-                
             case PKT_TEXT_ACK:
             case PKT_VIDEO_ACK:
             case PKT_IMAGE_ACK:

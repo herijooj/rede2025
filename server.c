@@ -214,7 +214,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
                 // Check for treasure first, then send appropriate response
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
-                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                    send_ack_with_position(game->socket_fd, &game->client_addr, PKT_OK_ACK, game->player_x, game->player_y);
                 }
             } else {
                 send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
@@ -226,7 +226,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
                 log_movement(game, "LEFT");
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
-                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                    send_ack_with_position(game->socket_fd, &game->client_addr, PKT_OK_ACK, game->player_x, game->player_y);
                 }
             } else {
                 send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
@@ -238,7 +238,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
                 log_movement(game, "UP");
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
-                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                    send_ack_with_position(game->socket_fd, &game->client_addr, PKT_OK_ACK, game->player_x, game->player_y);
                 }
             } else {
                 send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
@@ -250,7 +250,7 @@ void process_client_packet(GameState *game, const Packet *pkt) {
                 log_movement(game, "DOWN");
                 int treasure_found = check_treasure_discovery(game);
                 if (!treasure_found) {
-                    send_ack(game->socket_fd, &game->client_addr, PKT_OK_ACK);
+                    send_ack_with_position(game->socket_fd, &game->client_addr, PKT_OK_ACK, game->player_x, game->player_y);
                 }
             } else {
                 send_error(game->socket_fd, &game->client_addr, ERR_NO_PERMISSION);
@@ -338,12 +338,14 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     // Send file size using proper stop-and-wait
     Packet size_pkt = {
         .start_marker = START_MARKER,
-        .size = sizeof(uint32_t),
-        .seq = game->seq_num++,
+        .size = sizeof(uint32_t) + 2, // Add 2 for coordinates
+        .seq = (game->seq_num++) & 0x1F,
         .type = PKT_SIZE
     };
     uint32_t file_size = htonl(st.st_size);
     memcpy(size_pkt.data, &file_size, sizeof(uint32_t));
+    size_pkt.data[sizeof(uint32_t)] = game->player_x;
+    size_pkt.data[sizeof(uint32_t) + 1] = game->player_y;
     size_pkt.checksum = calculate_crc(&size_pkt);
     
     if (send_packet(game->socket_fd, &size_pkt, &game->client_addr) < 0) {
@@ -358,7 +360,7 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     Packet name_pkt = {
         .start_marker = START_MARKER,
         .size = strlen(filename),
-        .seq = game->seq_num++,
+        .seq = (game->seq_num++) & 0x1F,
         .type = file_type
     };
     strcpy((char*)name_pkt.data, filename);
@@ -378,7 +380,7 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
         Packet data_pkt = {
             .start_marker = START_MARKER,
             .size = bytes_read,
-            .seq = game->seq_num++,
+            .seq = (game->seq_num++) & 0x1F,
             .type = PKT_DATA
         };
         memcpy(data_pkt.data, buffer, bytes_read);
@@ -399,7 +401,7 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
     Packet eof_pkt = {
         .start_marker = START_MARKER,
         .size = 0,
-        .seq = game->seq_num++,
+        .seq = (game->seq_num++) & 0x1F,
         .type = PKT_END_FILE
     };
     eof_pkt.checksum = calculate_crc(&eof_pkt);

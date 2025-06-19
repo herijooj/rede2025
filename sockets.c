@@ -233,6 +233,25 @@ void send_ack(int socket_fd, struct sockaddr_ll *addr, uint8_t type) {
            (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
 }
 
+// Send ACK packet with position
+void send_ack_with_position(int socket_fd, struct sockaddr_ll *addr, uint8_t type, uint8_t x, uint8_t y) {
+    Packet ack = {
+        .start_marker = START_MARKER,
+        .size = 2,  // For X and Y coordinates
+        .seq = 0,  // Sequence number should be set by caller if needed
+        .type = type
+    };
+    ack.data[0] = x;
+    ack.data[1] = y;
+    ack.checksum = calculate_crc(&ack);
+    
+    PacketRaw ack_raw;
+    pack_packet(&ack, &ack_raw);
+    
+    sendto(socket_fd, &ack_raw, sizeof(PacketRaw), 0,
+           (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
+}
+
 // Send error packet
 void send_error(int socket_fd, struct sockaddr_ll *addr, uint8_t code) {
     Packet err = {

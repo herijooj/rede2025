@@ -91,6 +91,7 @@ uint8_t calculate_crc(const Packet *pkt);
 int     send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr);
 ssize_t receive_packet(int socket_fd, Packet *pkt, struct sockaddr_ll *addr);
 void    send_ack(int socket_fd, struct sockaddr_ll *addr, uint8_t type);
+void    send_ack_with_position(int socket_fd, struct sockaddr_ll *addr, uint8_t type, uint8_t x, uint8_t y);
 void    send_error(int socket_fd, struct sockaddr_ll *addr, uint8_t code);
 int     set_socket_timeout(int socket_fd, int timeout_ms);
 int     get_interface_info(int socket_fd, const char *iface, struct sockaddr_ll *addr);
