@@ -13,7 +13,7 @@
 
 typedef struct {
     int x, y;
-    char filename[64];
+    char filename[512];  // Increased from 64 to 512 to accommodate full paths
     int discovered;
 } Treasure;
 
