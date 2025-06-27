@@ -265,6 +265,7 @@ int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
     uint32_t file_size = 0;
     uint32_t bytes_received = 0;
     FILE *file = NULL;
+    uint8_t expected_seq = 255; // Track expected sequence number
     
     // The first packet (PKT_SIZE) is passed in, process it first.
     if (initial_pkt->type == PKT_SIZE && initial_pkt->size >= sizeof(uint32_t)) {
@@ -277,16 +278,81 @@ int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
             printf("Error: Insufficient disk space!\n");
             return -1;
         }
+        
+        // Send single ACK for the initial PKT_SIZE packet
+        Packet ack = {
+            .start_marker = START_MARKER,
+            .size = 0,
+            .seq = initial_pkt->seq,
+            .type = PKT_ACK
+        };
+        ack.checksum = calculate_crc(&ack);
+        
+        PacketRaw ack_raw;
+        pack_packet(&ack, &ack_raw);
+        sendto(client->socket_fd, &ack_raw, sizeof(PacketRaw), 0,
+              (struct sockaddr *)&client->server_addr, sizeof(client->server_addr));
+        
+        expected_seq = (initial_pkt->seq + 1) % 32; // Next expected sequence
     } else {
         fprintf(stderr, "Error: receive_file_transfer started with invalid packet.\n");
         return -1;
     }
 
-    // Receive subsequent packets until end of file using proper stop-and-wait protocol
+    // Set socket timeout for file transfer
+    set_socket_timeout(client->socket_fd, 2000); // Increased to 2 second timeout
+
+    // Receive subsequent packets until end of file
     Packet pkt;
-    while (1) {
-        ssize_t received = receive_packet(client->socket_fd, &pkt, &client->server_addr);
-        if (received <= 0) continue;
+    int consecutive_timeouts = 0;
+    const int max_timeouts = 15; // Increased timeout tolerance
+    
+    while (consecutive_timeouts < max_timeouts) {
+        // Use direct recvfrom for better control during file transfer
+        PacketRaw raw_pkt;
+        struct sockaddr_ll server_addr;
+        socklen_t addr_len = sizeof(server_addr);
+        
+        ssize_t received = recvfrom(client->socket_fd, &raw_pkt, sizeof(PacketRaw), 0,
+                                  (struct sockaddr *)&server_addr, &addr_len);
+        
+        if (received != sizeof(PacketRaw)) {
+            consecutive_timeouts++;
+            if (consecutive_timeouts % 5 == 0) {
+                printf("Timeout waiting for packet (%d/%d) - expected seq=%d\n", 
+                       consecutive_timeouts, max_timeouts, expected_seq);
+            }
+            continue;
+        }
+        
+        // Unpack and validate packet
+        unpack_packet(&raw_pkt, &pkt);
+        if (!validate_packet(&pkt)) {
+            consecutive_timeouts++;
+            continue;
+        }
+        
+        consecutive_timeouts = 0; // Reset timeout counter on valid packet
+        
+        // Always send ACK for valid packets - but only once
+        Packet ack = {
+            .start_marker = START_MARKER,
+            .size = 0,
+            .seq = pkt.seq,
+            .type = PKT_ACK
+        };
+        ack.checksum = calculate_crc(&ack);
+        
+        PacketRaw ack_raw;
+        pack_packet(&ack, &ack_raw);
+        sendto(client->socket_fd, &ack_raw, sizeof(PacketRaw), 0,
+              (struct sockaddr *)&server_addr, sizeof(server_addr));
+        
+        // Process packet only if it's the expected sequence (strict order)
+        if (pkt.seq != expected_seq) {
+            // Out of order packet - just ACK it but don't process
+            continue;
+        }
         
         switch (pkt.type) {
             case PKT_TEXT_ACK:
@@ -298,6 +364,7 @@ int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
                 filename[pkt.size] = '\0';
                 snprintf(filepath, sizeof(filepath), "%s/%s", RECEIVED_FILES_DIR, filename);
                 
+                if (file) fclose(file);  // Close any previous file
                 file = fopen(filepath, "wb");
                 if (!file) {
                     printf("Error: Could not create file %s\n", filepath);
@@ -307,11 +374,11 @@ int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
                 break;
                 
             case PKT_DATA:
-                // File data packet
+                // File data packet - write in strict order
                 if (file && pkt.size > 0) {
                     fwrite(pkt.data, 1, pkt.size, file);
                     bytes_received += pkt.size;
-                    printf("Received %u/%u bytes\r", bytes_received, file_size);
+                    printf("Received %u/%u bytes (seq: %d)\r", bytes_received, file_size, pkt.seq);
                     fflush(stdout);
                 }
                 break;
@@ -335,11 +402,15 @@ int receive_file_transfer(ClientState *client, const Packet *initial_pkt) {
                 return 0;
                 
             default:
+                // Ignore unexpected packets
                 break;
         }
+        
+        expected_seq = (pkt.seq + 1) % 32; // Update expected sequence
     }
     
     if (file) fclose(file);
+    printf("\nFile transfer failed due to timeouts\n");
     return -1;
 }
 

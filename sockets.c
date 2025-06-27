@@ -4,6 +4,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/time.h>
+#include <unistd.h>  // Added for usleep
 
 // Helper function to get current timestamp in milliseconds
 static long long get_timestamp_ms(void) {
@@ -137,7 +138,7 @@ int send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr) {
     raw_pkt.checksum = pkt->checksum;
     
     int timeout_ms = 1000;  // Start with 1 second timeout
-    const int max_retries = 5;
+    const int max_retries = 10;  // More retries for problematic sequences
     int retries = 0;
     
     while (retries < max_retries) {
@@ -146,30 +147,70 @@ int send_packet(int socket_fd, const Packet *pkt, struct sockaddr_ll *addr) {
             return -1;
         }
         
-        // Send the packed packet
-        ssize_t sent = sendto(socket_fd, &raw_pkt, sizeof(PacketRaw), 0,
-                            (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
+        // Add progressive delay between retries to avoid overwhelming socket buffer
+        if (retries > 0) {
+            usleep(retries * 100000); // 100ms * retry_count delay
+        }
         
-        if (sent == sizeof(PacketRaw)) {
-            // Wait for ACK
+        // Send the packed packet with retry logic for EAGAIN
+        ssize_t sent = -1;
+        int send_attempts = 0;
+        while (send_attempts < 5 && sent != sizeof(PacketRaw)) {
+            sent = sendto(socket_fd, &raw_pkt, sizeof(PacketRaw), 0,
+                         (struct sockaddr *)addr, sizeof(struct sockaddr_ll));
+            
+            if (sent != sizeof(PacketRaw)) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    // Socket buffer full, wait and retry
+                    usleep(200000); // 200ms delay
+                    send_attempts++;
+                    continue;
+                } else {
+                    break; // Other error, don't retry sends
+                }
+            }
+        }
+        
+        if (sent != sizeof(PacketRaw)) {
+            retries++;
+            timeout_ms = (timeout_ms < 2000) ? timeout_ms + 300 : 2000;
+            continue;
+        }
+        
+        // For certain packet types, don't wait for ACK (like ACKs themselves)
+        if (pkt->type == PKT_ACK || pkt->type == PKT_NACK) {
+            return 0; // Don't wait for ACK on ACK packets
+        }
+        
+        // Wait for ACK - STRICT sequence number matching
+        long long ack_start = get_timestamp_ms();
+        
+        while (get_timestamp_ms() - ack_start < timeout_ms) {
             PacketRaw ack_raw;
-            ssize_t received = recvfrom(socket_fd, &ack_raw, sizeof(PacketRaw), 0, NULL, NULL);
+            struct sockaddr_ll from_addr;
+            socklen_t from_len = sizeof(from_addr);
+            
+            ssize_t received = recvfrom(socket_fd, &ack_raw, sizeof(PacketRaw), 0, 
+                                      (struct sockaddr *)&from_addr, &from_len);
             
             if (received == sizeof(PacketRaw)) {
                 Packet ack;
                 unpack_packet(&ack_raw, &ack);
                 
-                if (ack.start_marker == START_MARKER &&
+                if (ack.start_marker == START_MARKER && 
                     ack.type == PKT_ACK &&
-                    validate_packet(&ack)) {
-                    return 0;  // Success
+                    validate_packet(&ack) &&
+                    ack.seq == pkt->seq) {
+                    return 0;  // Success - exact ACK received
                 }
             }
+            
+            // Brief pause to avoid busy waiting
+            usleep(10000); // 10ms
         }
         
-        // If we get here, either send failed or no valid ACK received
         retries++;
-        timeout_ms *= 2;  // Exponential backoff
+        timeout_ms = (timeout_ms < 2000) ? timeout_ms + 300 : 2000;
     }
     
     return -1;  // All retries failed
@@ -193,7 +234,7 @@ ssize_t receive_packet(int socket_fd, Packet *pkt, struct sockaddr_ll *addr) {
             unpack_packet(&raw_pkt, pkt);
             
             if (validate_packet(pkt)) {
-                // Send ACK
+                // Send ACK - always send ACK for valid packets
                 Packet ack = {
                     .start_marker = START_MARKER,
                     .size = 0,
@@ -205,10 +246,17 @@ ssize_t receive_packet(int socket_fd, Packet *pkt, struct sockaddr_ll *addr) {
                 PacketRaw ack_raw;
                 pack_packet(&ack, &ack_raw);
                 
-                if (sendto(socket_fd, &ack_raw, sizeof(PacketRaw), 0,
-                          (struct sockaddr *)addr, addr_len) == sizeof(PacketRaw)) {
-                    return received;
+                // Send ACK multiple times to ensure delivery for critical data packets
+                int ack_attempts = (pkt->type == PKT_DATA) ? 2 : 1;
+                for (int i = 0; i < ack_attempts; i++) {
+                    sendto(socket_fd, &ack_raw, sizeof(PacketRaw), 0,
+                          (struct sockaddr *)addr, addr_len);
+                    if (i < ack_attempts - 1) {
+                        usleep(10000); // 10ms delay between ACK attempts
+                    }
                 }
+                
+                return received;
             }
         }
     }

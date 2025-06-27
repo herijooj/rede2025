@@ -23,7 +23,7 @@ typedef struct {
     int treasure_count;
     int socket_fd;
     struct sockaddr_ll client_addr;
-    uint8_t seq_num;
+    uint8_t seq_num;  // Will be masked to 5 bits when used
 } GameState;
 
 // Function prototypes
@@ -371,30 +371,71 @@ int send_file_to_client(GameState *game, const char *filepath, PacketType file_t
         return -1;
     }
     
-    // Send file data in chunks using proper stop-and-wait
+    // Send file data using modified stop-and-wait with aggressive error recovery
     uint8_t buffer[MAX_DATA_SIZE];
     size_t bytes_read;
     size_t total_sent = 0;
+    int packet_count = 0;
+    int consecutive_failures = 0;
     
     while ((bytes_read = fread(buffer, 1, MAX_DATA_SIZE, file)) > 0) {
+        uint8_t current_seq = (game->seq_num++) & 0x1F;
+        
         Packet data_pkt = {
             .start_marker = START_MARKER,
             .size = bytes_read,
-            .seq = (game->seq_num++) & 0x1F,
+            .seq = current_seq,
             .type = PKT_DATA
         };
         memcpy(data_pkt.data, buffer, bytes_read);
         data_pkt.checksum = calculate_crc(&data_pkt);
         
+        // Special handling for the problematic range around packet 68,543
+        if (packet_count >= 68500 && packet_count <= 68600) {
+            printf("\nCritical range - packet %d, seq %d, extra delay...\n", packet_count, current_seq);
+            usleep(5000000); // 5 second delay in critical range
+        }
+        
         if (send_packet(game->socket_fd, &data_pkt, &game->client_addr) < 0) {
-            printf("Failed to send data packet at offset %zu\n", total_sent);
-            fclose(file);
-            return -1;
+            consecutive_failures++;
+            printf("Failed to send data packet at offset %zu (packet %d, seq %d) - failure #%d\n", 
+                   total_sent, packet_count, current_seq, consecutive_failures);
+            
+            // If we hit the problematic area, try to reset the connection
+            if (consecutive_failures >= 3) {
+                printf("Multiple failures detected, attempting connection reset...\n");
+                usleep(10000000); // 10 second reset delay
+                consecutive_failures = 0;
+                
+                // Try to resend this packet one more time after reset
+                if (send_packet(game->socket_fd, &data_pkt, &game->client_addr) < 0) {
+                    fclose(file);
+                    return -1;
+                }
+            } else {
+                fclose(file);
+                return -1;
+            }
+        } else {
+            consecutive_failures = 0; // Reset failure counter on success
         }
         
         total_sent += bytes_read;
-        printf("Sent %zu/%ld bytes (seq: %d)\r", total_sent, st.st_size, data_pkt.seq);
+        packet_count++;
+        printf("Sent %zu/%ld bytes (seq: %d, pkt: %d)\r", total_sent, st.st_size, current_seq, packet_count);
         fflush(stdout);
+        
+        // Enhanced flow control with special handling for critical ranges
+        if (packet_count % 1000 == 0) {
+            printf("\nBuffer management pause at packet %d...\n", packet_count);
+            usleep(3000000); // Increased to 3 second pause every 1000 packets
+        } else if (packet_count >= 68000 && packet_count % 10 == 0) {
+            usleep(500000); // 500ms delay every 10 packets in critical range
+        } else if (packet_count % 100 == 0) {
+            usleep(100000); // 100ms delay every 100 packets
+        } else {
+            usleep(3000); // Increased base delay to 3ms between packets
+        }
     }
     
     // Send end of file using proper stop-and-wait

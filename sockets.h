@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <string.h>  // Added for memcpy in inline functions
 
-#define MAX_DATA_SIZE 127
+#define MAX_DATA_SIZE 64  // Keep smaller packets that were working better
 #define START_MARKER   0x7E
 
 // Packet types
